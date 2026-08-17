@@ -10,6 +10,8 @@
 #
 #   herdr-bellwethr conventions              how this repo names branches
 #   herdr-bellwethr dispatch "<task>" --branch feat/x    hand it to an agent
+#   herdr-bellwethr runs                     what was dispatched, and how it went
+#   herdr-bellwethr report <run> --file f    an agent recording how its own went
 #   herdr-bellwethr reap                     worktrees that look finished with
 #
 # `save` snapshots the space you are looking at — tabs, panes, split directions,
@@ -21,6 +23,13 @@
 # name — which names a repo accepts is the repo's business, so `conventions`
 # reports the evidence and the caller chooses. `reap` clears up afterwards, and
 # removes nothing until told to.
+#
+# `dispatch` also opens a run record and tells the agent, in the task itself, to
+# close it with `report` — because the worktree, the workspace and the agent's
+# pane are all things `reap` deletes, and everything the agent knew that is not
+# in the diff goes with them. `runs` is the other half: which dispatches are
+# still outstanding and what happened to the ones that finished, answered from
+# disk without waiting on anybody.
 #
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
@@ -34,6 +43,7 @@ import os
 import os.path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -52,6 +62,12 @@ SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvi
 # The plugin whose config dir holds projects/ — herdr-plus, not this one. The
 # projects browser reads them, we write them, so the path has to be its dir.
 PLUS_ID = "cloudmanic.herdr-plus"
+
+# Ours, for run records. herdr provisions and keeps a config dir per plugin, and
+# a run record is per-machine state about work done on this machine — the same
+# category as saved projects and session state, which the README is clear the
+# repository does not carry.
+SELF_ID = "herdr-bellwethr"
 
 PROG = "herdr-bellwethr"
 
@@ -120,16 +136,17 @@ def herdr(*args):
     return payload.get("result", {})
 
 
-def plugin_config_dir():
-    """Where herdr-plus keeps projects/, asked of herdr rather than guessed.
+def plugin_config_dir(plugin_id, fallback):
+    """A plugin's config dir, asked of herdr rather than guessed.
 
-    herdr provisions this directory and keeps it across plugin upgrades, so it
-    is the same path the projects browser reads. Outside herdr the plugin falls
-    back to ~/.config/herdr-plus, and so do we.
+    herdr provisions this directory and keeps it across plugin upgrades, so for
+    herdr-plus it is the same path the projects browser reads, and for ours it
+    is the one place a run record survives an upgrade of this plugin. Outside
+    herdr a plugin falls back to ~/.config/<name>, and so do we.
     """
     try:
         proc = subprocess.run(
-            ("herdr", "plugin", "config-dir", PLUS_ID),
+            ("herdr", "plugin", "config-dir", plugin_id),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
@@ -139,13 +156,13 @@ def plugin_config_dir():
         if path and not path.startswith("{"):
             return path
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "herdr-plus")
+    return os.path.join(base, fallback)
 
 
 def projects_dir(override):
     if override:
         return os.path.expanduser(override)
-    return os.path.join(plugin_config_dir(), "projects")
+    return os.path.join(plugin_config_dir(PLUS_ID, "herdr-plus"), "projects")
 
 
 # --------------------------------------------------------------- inventory --
@@ -1065,6 +1082,445 @@ def cmd_conventions(args):
         print("worth reading: %s" % ", ".join(evidence["convention_docs"]))
 
 
+# -------------------------------------------------------------- run records --
+#
+# The only part of a dispatch that outlives it.
+#
+# `dispatch` hands a task to an agent in a worktree and returns. `reap` later
+# removes that worktree, its workspace and the agent's pane together, and
+# everything the agent knew that is not in the diff — what it decided and why,
+# what it deliberately did not check, what it learned about the machine rather
+# than the code — goes with them, silently. The dispatcher never finds out.
+#
+# So `dispatch` opens a record here and the agent closes it with `report`. The
+# records live in this plugin's own config dir: herdr provisions it and keeps it
+# across upgrades, and what accumulates in it is per-machine state, which is
+# exactly the category the README says the repository deliberately leaves out.
+#
+# JSON, because both readers are as often agents as people, and because
+# everything this script already exchanges with herdr is JSON. `runs <id>`
+# renders a record as Markdown for a human and `report --comment` posts that
+# same Markdown to the pull request — the record is for whoever dispatched the
+# agent, the comment is for whoever reads the diff, and neither replaces the
+# other: a pull request is closed and squashed away, a record is not.
+
+RUNS_DIRNAME = "runs"
+
+# Where the task tells the agent to draft its outcome. Named here rather than
+# left to the agent because `reap` has to know to ignore it: a file this tool's
+# own protocol asked for must not read as somebody mid-edit, for exactly the
+# reason the task file must not.
+OUTCOME_DRAFT = ".bellwethr-outcome.json"
+
+# Sortable on purpose. An orchestrator with six finished runs wants to know
+# which one to read first, and prose in this field cannot answer that — so the
+# doubt itself goes in needs_decision and this stays one of three words.
+CONFIDENCE = ("high", "medium", "low")
+
+# What an agent is asked for, in the order it is asked and rendered. The
+# template `report --template` prints is generated from this, so the questions
+# an agent answers cannot drift from the fields a record holds.
+#
+# The list is short on purpose: every field is something a reaped worktree took
+# with it and the diff could not give back. Nothing is here for completeness.
+OUTCOME_FIELDS = (
+    ("summary", "text", "What you did, in a few sentences."),
+    ("not_done", "list", "What you deliberately did not do, and what you did not check."),
+    ("decisions", "list", "What you decided and why — the why is the half the diff loses."),
+    ("review_first", "list", "What a reviewer should look at first, and what to look for."),
+    ("learned", "list", "What you learned that does not belong in the repository."),
+    ("needs_decision", "list", "Anything now waiting on somebody else to decide."),
+    ("confidence", "text", "How sure you are of the work: high, medium or low."),
+    ("pr", "text", "The pull request, if you opened one. Found with gh if you omit it."),
+)
+
+OUTCOME_HEADINGS = {
+    "not_done": "Not done, not checked",
+    "decisions": "Decisions",
+    "review_first": "Look at this first",
+    "learned": "Learned",
+    "needs_decision": "Needs a decision",
+}
+
+
+def now_stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def runs_dir(override):
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(plugin_config_dir(SELF_ID, SELF_ID), RUNS_DIRNAME)
+
+
+def read_run(path):
+    """One record, or None if it is unreadable or is not one of ours.
+
+    Unreadable is treated as absent rather than fatal. These files are read by
+    `reap` in one worktree while an agent may be writing one from another, and a
+    directory somebody dropped a stray file into is not a reason to refuse to
+    reap anything at all.
+    """
+    try:
+        with open(path) as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not record.get("branch"):
+        return None
+    return record
+
+
+def load_runs(directory):
+    """Every record as (path, record), newest dispatch first."""
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return []
+
+    found = []
+    for entry in entries:
+        if not entry.endswith(".json"):
+            continue
+        path = os.path.join(directory, entry)
+        record = read_run(path)
+        if record is not None:
+            found.append((path, record))
+    return sorted(found, key=lambda item: item[1].get("dispatched_at") or "", reverse=True)
+
+
+def write_run(path, record):
+    """Write a record. Returns "" or the reason it could not be written.
+
+    Through a temporary file in the same directory, then renamed: a record is
+    read by other processes, read_run treats a half-written one as no record at
+    all, and for `reap` that is the difference between keeping a worktree and
+    removing it.
+    """
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w") as handle:
+            # ensure_ascii off: a record holds an agent's prose, and a human
+            # reading the file should not have to decode \u2014 to read a dash.
+            json.dump(record, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return str(exc)
+    return ""
+
+
+def remove_run(path):
+    """Drop a record for a dispatch that was rolled back.
+
+    Quiet about its own failure for the same reason teardown is: this runs while
+    a different error is being reported, and a leftover record is a smaller
+    problem than losing the message that explains what actually went wrong.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def free_run_path(directory, slug):
+    """A record file name nothing is using yet.
+
+    A branch name is unique among live branches, which is what makes it a usable
+    id — but branches are deleted and their names come back, and the record of
+    what happened the first time is the thing least able to defend itself. A new
+    dispatch never overwrites an old record.
+    """
+    path = os.path.join(directory, slug + ".json")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, "%s-%d.json" % (slug, n))
+        n += 1
+    return path
+
+
+def run_id(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def match_runs(runs, wanted, cwd):
+    """Records matching an id, a branch, or the checkout the caller stands in.
+
+    Three ways in because the caller looking a run up is sometimes the
+    dispatcher, which has the id, and sometimes the agent, which has no reason
+    to have kept it but is standing in the checkout the record names.
+    """
+    if not wanted:
+        here = os.path.realpath(cwd)
+        return [(p, r) for p, r in runs
+                if r.get("checkout") and os.path.realpath(r["checkout"]) == here]
+
+    wanted = wanted.strip()
+    exact = [(p, r) for p, r in runs
+             if run_id(p) == wanted or r.get("branch") == wanted]
+    if exact:
+        return exact
+    return [(p, r) for p, r in runs if run_id(p).startswith(wanted)]
+
+
+def run_for(runs, path, branch):
+    """The record describing a worktree, matched on its checkout then its branch.
+
+    Checkout first and across every record before branch is tried at all: a
+    branch checked out somewhere else is a weaker claim than a path, and the
+    branch fallback is only there for a worktree that was moved.
+    """
+    here = os.path.realpath(path)
+    for record_path, record in runs:
+        checkout = record.get("checkout")
+        if checkout and os.path.realpath(checkout) == here:
+            return record_path, record
+    if branch:
+        for record_path, record in runs:
+            if record.get("branch") == branch:
+                return record_path, record
+    return None
+
+
+def run_state(record):
+    if record.get("reaped_at"):
+        return "reaped"
+    if record.get("outcome"):
+        return "reported"
+    return "outstanding"
+
+
+def describe_runs(runs, limit=6):
+    names = [run_id(p) for p, _ in runs[:limit]]
+    return ", ".join(names) + (", ..." if len(runs) > limit else "")
+
+
+def agent_index():
+    """Where each live agent is, indexed by pane id and by working directory.
+
+    By pane first because that is the handle that survives a herdr restart — the
+    alias `dispatch` reported does not, and `agent prompt <name>` answers
+    agent_not_found once herdr has forgotten it. The cwd index is the fallback
+    for a run whose agent came back in a different pane.
+    """
+    by_pane, by_cwd = {}, {}
+    for agent in herdr_quiet("agent", "list")[0].get("agents", []):
+        status = agent.get("agent_status") or "?"
+        if agent.get("pane_id"):
+            by_pane[agent["pane_id"]] = status
+        if agent.get("cwd"):
+            by_cwd[os.path.realpath(agent["cwd"])] = status
+    return by_pane, by_cwd
+
+
+def agent_state(record, by_pane, by_cwd):
+    """What the dispatched agent is doing now, or "gone" if it is not there."""
+    pane = record.get("pane")
+    if pane and pane in by_pane:
+        return by_pane[pane]
+    checkout = record.get("checkout")
+    if checkout:
+        found = by_cwd.get(os.path.realpath(checkout))
+        if found:
+            return found
+    return "gone"
+
+
+def outcome_template():
+    """The document `report` wants, with the questions still in it.
+
+    Generated from OUTCOME_FIELDS. JSON has no comments, so each question is the
+    placeholder value of the field that asks it — an agent that fills the
+    template in has answered them in order, and one that leaves a question
+    standing is caught by `report`, which refuses to record its own prompts as
+    an outcome.
+    """
+    doc = {}
+    for name, kind, question in OUTCOME_FIELDS:
+        doc[name] = [question] if kind == "list" else question
+    return json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def as_bullets(value):
+    """A field's entries as strings, whatever shape they arrived in.
+
+    A list is the documented shape; a single paragraph is what gets written when
+    there is one thing to say, and refusing that would cost more than accepting
+    it. A decision written as {"decision": ..., "why": ...} is joined rather
+    than rejected for the same reason — the point is to keep what the agent
+    said, not to win an argument about the schema.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, dict):
+        value = [value]
+
+    out = []
+    for entry in value:
+        if isinstance(entry, dict):
+            parts = [str(entry[key]).strip()
+                     for key in ("decision", "what", "why", "because", "detail")
+                     if entry.get(key)]
+            text = " — ".join(parts) or json.dumps(entry, sort_keys=True)
+        else:
+            text = str(entry).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def outcome_markdown(record):
+    """A record's outcome as Markdown.
+
+    One renderer for both audiences: the text `runs <id>` prints for a human is
+    the text `report --comment` posts to the pull request. Two would drift, and
+    the version the human read would be the one that was wrong.
+    """
+    outcome = record.get("outcome") or {}
+    lines = ["## Outcome — %s" % (record.get("branch") or record.get("id") or "?"), ""]
+
+    summary = (outcome.get("summary") or "").strip()
+    if summary:
+        lines += [summary, ""]
+    if outcome.get("confidence"):
+        lines += ["**Confidence:** %s" % outcome["confidence"], ""]
+
+    for name, _, _ in OUTCOME_FIELDS:
+        if name not in OUTCOME_HEADINGS:
+            continue
+        bullets = as_bullets(outcome.get(name))
+        if not bullets:
+            continue
+        lines.append("### %s" % OUTCOME_HEADINGS[name])
+        lines += ["- %s" % bullet.replace("\n", "\n  ") for bullet in bullets]
+        lines.append("")
+
+    # Read from git rather than reported: see landed_facts.
+    commits = outcome.get("commits") or []
+    if commits or outcome.get("diffstat"):
+        lines.append("### What landed")
+        if outcome.get("diffstat"):
+            lines.append("%s on `%s`." % (outcome["diffstat"], record.get("branch")))
+            lines.append("")
+        lines += ["- `%s`" % commit for commit in commits]
+        lines.append("")
+
+    known = set(name for name, _, _ in OUTCOME_FIELDS) | {
+        "reported_at", "commits", "diffstat", "head"}
+    extra = sorted(name for name in outcome if name not in known)
+    if extra:
+        # Something the agent had to say that there was no field for. Dropping
+        # it silently is the exact failure this record exists to prevent.
+        lines.append("### Also reported")
+        for name in extra:
+            for bullet in as_bullets(outcome[name]) or [json.dumps(outcome[name])]:
+                lines.append("- **%s**: %s" % (name, bullet))
+        lines.append("")
+
+    lines += ["---", "", "Run `%s`, reported %s by `%s report`." % (
+        record.get("id") or "?", outcome.get("reported_at") or "?", PROG)]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def landed_facts(record):
+    """What the branch holds, read from git rather than taken on trust.
+
+    The agent is the authority on why it did something and a poor one on what it
+    committed. These are also read *now*, at report time: after `reap` the
+    branch may be gone, and this record will be the only place they exist.
+    """
+    repo = record.get("repo")
+    branch = record.get("branch")
+    base = record.get("base") or "main"
+    if not (repo and branch and os.path.isdir(repo)):
+        return {}
+
+    facts = {}
+    code, head, _ = git(repo, "rev-parse", "--short", branch)
+    if code == 0 and head:
+        facts["head"] = head
+    code, log, _ = git(repo, "log", "--oneline", "--no-decorate",
+                       "%s..%s" % (base, branch))
+    if code == 0:
+        facts["commits"] = [line for line in log.splitlines() if line]
+    # Three dots: what the branch added, not what the base did meanwhile.
+    code, stat, _ = git(repo, "diff", "--shortstat", "%s...%s" % (base, branch))
+    if code == 0 and stat:
+        facts["diffstat"] = stat
+    return facts
+
+
+def gh_pr_url(repo, branch):
+    """The pull request for a branch, if gh can see one.
+
+    Best effort in every direction: no gh, no network, no remote and no pull
+    request all come back the same way, and none of them is a reason to refuse a
+    report. --pr says it outright when this cannot.
+    """
+    if not shutil.which("gh"):
+        return ""
+    try:
+        proc = subprocess.run(
+            ("gh", "pr", "view", branch, "--json", "url", "--jq", ".url"),
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def post_pr_comment(repo, branch, body):
+    """Post an outcome to the branch's pull request. Returns "" or why not.
+
+    Never fatal. The record is already written by the time this runs, so a
+    failure here loses a convenience and not the outcome — which is the whole
+    reason the record is not the pull request comment.
+    """
+    if not shutil.which("gh"):
+        return "gh is not on PATH"
+    try:
+        proc = subprocess.run(
+            ("gh", "pr", "comment", branch, "--body-file", "-"),
+            cwd=repo, input=body.encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        return str(exc)
+    if proc.returncode == 0:
+        return ""
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    return err.splitlines()[0] if err else "gh pr comment exited %d" % proc.returncode
+
+
+def report_command():
+    """How an agent in a worktree should invoke this script.
+
+    `herdr-bellwethr` on PATH is the answer that stays true when this checkout
+    moves, so it is preferred — but only after checking that the one on PATH
+    understands `report` at all. On a machine whose PATH points at an older
+    install, or at a primary checkout while this is still on a branch, an agent
+    would otherwise be told to run a subcommand that does not exist yet.
+    """
+    found = shutil.which(PROG)
+    if found:
+        try:
+            probe = subprocess.run(
+                (found, "report", "--template"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == 0:
+                return PROG
+        except OSError:
+            pass
+    return os.path.realpath(__file__)
+
+
 # ----------------------------------------------------------------- dispatch --
 
 # A herdr agent alias has to match this and be unique among *live* agents.
@@ -1233,23 +1689,34 @@ def fail(args, stage, message, detail=""):
     sys.exit(1)
 
 
-def task_document(args, repo, checkout, branch, workspace_id, pane_id):
-    """The task, plus the facts about where it is being carried out.
+def task_document(args, repo, checkout, branch, workspace_id, pane_id, run=None):
+    """The task, the facts about where it runs, and how to report back.
 
-    An agent dropped into a fresh worktree has no way to know it is in one. It
-    sees a checkout that looks like the repository and reasons about it as if it
-    were — which is how a task written by somebody sitting in the primary
-    checkout ends up asking for something only the primary checkout can do. The
-    difference is not a matter of opinion, so it is stated rather than left to
-    be discovered.
+    Two sections after the task, and the difference between them is deliberate.
 
-    Deliberately facts, not instructions. This says what is true of the place;
-    what to do about it belongs in the task, which is somebody else's to write.
+    The first is facts. An agent dropped into a fresh worktree has no way to
+    know it is in one. It sees a checkout that looks like the repository and
+    reasons about it as if it were — which is how a task written by somebody
+    sitting in the primary checkout ends up asking for something only the
+    primary checkout can do. The difference is not a matter of opinion, so it is
+    stated rather than left to be discovered. What to *do* about it is not said:
+    that belongs in the task, which is somebody else's to write.
+
+    The second is an instruction, and unlike the first it is dispatch's own to
+    give. Recording an outcome is not an opinion about the task; it is the
+    protocol of the machinery the agent was started by, and the same machinery —
+    `reap` — is what deletes the evidence when nobody records it. An agent that
+    reports only when the dispatcher remembers to ask is precisely the situation
+    this exists to end, so the asking is not left to the dispatcher.
+
+    `run` is None when no record could be opened. The instruction is then left
+    out rather than pointed at a run that does not exist: telling an agent to
+    run a command that will fail is worse than telling it nothing.
     """
     if args.no_context:
         return args.task.rstrip("\n") + "\n"
 
-    return (
+    document = (
         "%s\n"
         "\n"
         "---\n"
@@ -1272,6 +1739,41 @@ def task_document(args, repo, checkout, branch, workspace_id, pane_id):
         "checkout can do, say so in the pull request instead of forcing it.\n"
         % (args.task.rstrip("\n"), PROG, checkout, repo, branch, args.base,
            workspace_id, pane_id)
+    )
+
+    if not run:
+        return document
+
+    return document + (
+        "\n"
+        "## Before you finish: record the outcome\n"
+        "\n"
+        "This task is run `%s`. Nothing but you will close it.\n"
+        "\n"
+        "`%s reap` removes this worktree, its workspace and this pane together\n"
+        "once the work has landed. Everything you know that is not in the diff —\n"
+        "what you decided and why, what you deliberately did not check, what you\n"
+        "learned about this machine rather than about the code — goes with them,\n"
+        "and whoever dispatched you never finds out any of it.\n"
+        "\n"
+        "So write it down before you stop:\n"
+        "\n"
+        "```sh\n"
+        "%s report --template > %s   # the questions\n"
+        "# answer them, then\n"
+        "%s report %s --file %s\n"
+        "```\n"
+        "\n"
+        "Add `--comment` to post the same text to the pull request in one step.\n"
+        "The comment is for whoever reads the diff; the record is for whoever\n"
+        "dispatched you, and it outlives the branch, the pull request and this\n"
+        "checkout. Write both — they are read by different people at different\n"
+        "times, and only one of them survives a squash merge.\n"
+        "\n"
+        "`reap` will not remove this worktree until that record has an outcome.\n"
+        % (run["id"], PROG,
+           run["command"], OUTCOME_DRAFT,
+           run["command"], run["id"], OUTCOME_DRAFT)
     )
 
 
@@ -1308,25 +1810,83 @@ def cmd_dispatch(args):
             fail(args, "probe",
                  "the repo's pre-commit hook refused branch %s" % branch, output)
 
+    # The record is opened before the task is written, because the task has to
+    # name it, and writing it now is also what reserves the name against a
+    # second dispatch running at the same moment. It is written again below,
+    # once there is an agent to name in it.
+    #
+    # A record and the instruction to close it are opened together or not at
+    # all. A record nobody was told about would have `reap` guarding a worktree
+    # for an outcome that was never going to arrive — so --no-context, which
+    # asks for the task and nothing else, opts out of both.
+    #
+    # A record that cannot be *written* is a warning, not a failure. The
+    # worktree, the agent and the task are what a dispatch is for; a directory
+    # this could not write to is a reason to say so loudly, not to throw all
+    # three away.
+    record_path, record = None, None
+    if not args.no_context:
+        directory = runs_dir(args.runs_dir)
+        record_path = free_run_path(directory, slugify(branch))
+        record = {
+            "id": run_id(record_path),
+            "dispatched_at": now_stamp(),
+            "repo": repo,
+            "branch": branch,
+            "base": args.base,
+            "checkout": checkout,
+            "workspace": workspace_id,
+            "pane": pane_id,
+            "kind": args.kind,
+            "agent": None,
+            "task_file": os.path.join(checkout, args.task_file),
+            # The task itself, because the copy in the worktree is the one
+            # `reap` deletes, and an outcome whose question nobody can read
+            # afterwards is half a record.
+            "task": args.task.rstrip("\n"),
+            "outcome": None,
+            "reaped_at": None,
+        }
+        err = write_run(record_path, record)
+        if err:
+            warn("no run record for %s: %s — the agent will not be asked to "
+                 "report, and reap will not know to keep this worktree"
+                 % (branch, err))
+            record_path, record = None, None
+
     task_path = os.path.join(checkout, args.task_file)
     try:
         with open(task_path, "w") as handle:
-            handle.write(task_document(args, repo, checkout, branch,
-                                       workspace_id, pane_id))
+            handle.write(task_document(
+                args, repo, checkout, branch, workspace_id, pane_id,
+                run=None if record is None else {"id": record["id"],
+                                                 "command": report_command()}))
     except OSError as exc:
         teardown(workspace_id, repo, branch, checkout)
+        if record_path:
+            remove_run(record_path)
         fail(args, "task", "could not write %s: %s" % (task_path, exc))
 
     alias = args.agent_name or agent_alias(branch, live_agent_names())
     if not AGENT_NAME_RE.match(alias):
         teardown(workspace_id, repo, branch, checkout)
+        if record_path:
+            remove_run(record_path)
         fail(args, "agent", "not a usable agent name: %r" % alias)
 
     start, err = start_agent(alias, args.kind, pane_id, args.agent_timeout)
     if not start:
         teardown(workspace_id, repo, branch, checkout)
+        if record_path:
+            remove_run(record_path)
         fail(args, "agent", "%s did not come up in the new pane" % args.kind,
              err or "herdr agent start said nothing. Try `herdr agent explain`.")
+
+    if record_path:
+        record["agent"] = alias
+        err = write_run(record_path, record)
+        if err:
+            warn("run %s does not name its agent: %s" % (record["id"], err))
 
     prompt = args.prompt or (
         "Read %s in the repository root and start on it." % args.task_file)
@@ -1350,6 +1910,8 @@ def cmd_dispatch(args):
         "task_file": task_path,
         "prompted": bool(submitted),
         "prompt_error": prompt_err,
+        "run": None if record is None else record["id"],
+        "run_record": record_path,
     }
 
     if args.json:
@@ -1364,11 +1926,287 @@ def cmd_dispatch(args):
         print("  reach it   herdr agent prompt %s ...   (or %s, which survives "
               "a herdr restart)" % (alias, pane_id))
         print("  task       %s" % task_path)
+        if record is not None:
+            print("  run        %s   (%s runs %s, when it is done)"
+                  % (record["id"], PROG, record["id"]))
         if not submitted:
             print("  ! the prompt did not land: %s" % (prompt_err or "no reason given"))
             print("    submit it with `herdr agent prompt %s ...`" % alias)
 
     notify("Herdr Bellwethr: dispatched", "%s → %s" % (branch, alias))
+
+
+# ------------------------------------------------------------------- report --
+
+def outcome_from(args):
+    """The outcome to record: a document, some flags, or a document flags add to.
+
+    stdin is only read when `--file -` asks for it. An agent runs this with no
+    terminal attached often enough that guessing from isatty() would sooner or
+    later hang a report forever waiting on a pipe nobody is writing to.
+    """
+    doc = {}
+    if args.file:
+        if args.file == "-":
+            where, raw = "<stdin>", sys.stdin.read()
+        else:
+            where = os.path.expanduser(args.file)
+            try:
+                with open(where) as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                die("could not read %s: %s" % (where, exc))
+        try:
+            doc = json.loads(raw)
+        except ValueError as exc:
+            die("%s is not JSON (%s) — `%s report --template` prints the shape "
+                "this wants" % (where, exc, PROG))
+        if not isinstance(doc, dict):
+            die("%s should hold one JSON object, as `%s report --template` prints"
+                % (where, PROG))
+
+    for name, value in (("summary", args.summary), ("confidence", args.confidence),
+                        ("pr", args.pr)):
+        if value:
+            doc[name] = value
+
+    # Flags add to a document rather than replacing it, so a template answered
+    # in a file and a late thought passed on the command line both survive.
+    for name, values in (("not_done", args.not_done), ("decisions", args.decision),
+                         ("review_first", args.review_first),
+                         ("learned", args.learned),
+                         ("needs_decision", args.needs_decision)):
+        if values:
+            doc[name] = as_bullets(doc.get(name)) + list(values)
+    return doc
+
+
+def strip_placeholders(doc):
+    """Drop anything left exactly as `--template` printed it, keep the rest.
+
+    A question that was not answered is not an answer, and recording it would
+    have `runs` read the prompt back to the dispatcher as though it were the
+    report. Fields this script never asked for are kept: an outcome nobody
+    thought to ask for is still an outcome, and dropping it quietly is the
+    failure the whole record exists to prevent.
+    """
+    questions = dict((name, question) for name, _, question in OUTCOME_FIELDS)
+
+    out = {}
+    for name, kind, question in OUTCOME_FIELDS:
+        value = doc.get(name)
+        if kind == "list":
+            kept = [b for b in as_bullets(value) if b != question]
+            if kept:
+                out[name] = kept
+        elif isinstance(value, str):
+            if value.strip() and value.strip() != question:
+                out[name] = value.strip()
+        elif value:
+            out[name] = value
+
+    for name, value in doc.items():
+        if name not in questions and value:
+            out[name] = value
+    return out
+
+
+def resolve_run(directory, wanted, cwd):
+    """The one record a command was asked about, or a refusal explaining why not."""
+    runs = load_runs(directory)
+    if not runs:
+        die("no run records in %s — either nothing was dispatched from this "
+            "machine, or it was dispatched before records existed" % directory)
+
+    matches = match_runs(runs, wanted, cwd)
+    if not matches:
+        if wanted:
+            die("no run matching %r (have: %s)" % (wanted, describe_runs(runs)))
+        die("no run was dispatched into %s — name one instead (have: %s)"
+            % (cwd, describe_runs(runs)))
+    if len(matches) > 1:
+        die("%r matches %d runs (%s) — name one exactly"
+            % (wanted, len(matches), describe_runs(matches)))
+    return matches[0]
+
+
+def cmd_report(args):
+    if args.template:
+        sys.stdout.write(outcome_template())
+        return
+
+    path, record = resolve_run(runs_dir(args.runs_dir), args.run, os.getcwd())
+    outcome = strip_placeholders(outcome_from(args))
+
+    if not outcome.get("summary"):
+        die("a report needs at least a summary — `%s report --template` prints "
+            "the questions, and every one of them is something the worktree "
+            "takes with it when reap removes it" % PROG)
+
+    confidence = str(outcome.get("confidence") or "").strip().lower()
+    if confidence not in CONFIDENCE:
+        die("confidence should be one of %s, not %r — it is meant to be sorted "
+            "on, so what the doubt actually is belongs in needs_decision"
+            % (", ".join(CONFIDENCE), outcome.get("confidence") or ""))
+    outcome["confidence"] = confidence
+
+    outcome["reported_at"] = now_stamp()
+    outcome.update(landed_facts(record))
+    if not outcome.get("pr"):
+        found = gh_pr_url(record.get("repo") or os.getcwd(), record["branch"])
+        if found:
+            outcome["pr"] = found
+
+    # Reporting twice is an agent correcting itself, which is allowed — but the
+    # first answer is kept rather than overwritten. This record exists because
+    # something was lost the last time nobody kept a copy.
+    was = record.get("outcome")
+    if was:
+        record.setdefault("superseded", []).append(was)
+    record["outcome"] = outcome
+    err = write_run(path, record)
+    if err:
+        die("could not write %s: %s" % (path, err))
+
+    comment_err = ""
+    if args.comment:
+        comment_err = post_pr_comment(record.get("repo") or os.getcwd(),
+                                      record["branch"], outcome_markdown(record))
+
+    if args.json:
+        print(json.dumps({"ok": True, "run": record["id"], "record": path,
+                          "replaced": bool(was), "commented": args.comment and not comment_err,
+                          "comment_error": comment_err},
+                         indent=2, sort_keys=True))
+    else:
+        print("%s run %s -> %s" % ("re-reported" if was else "reported",
+                                   record["id"], path))
+        if outcome.get("pr"):
+            print("  pull request %s" % outcome["pr"])
+        if args.comment:
+            print("  comment      %s" % (comment_err or "posted"))
+        print("")
+        print("reap will remove %s now that this is recorded." % record["branch"])
+
+    notify("Herdr Bellwethr: outcome recorded",
+           "%s — confidence %s" % (record["branch"], confidence))
+
+
+# --------------------------------------------------------------------- runs --
+
+def show_run(record, path, by_pane, by_cwd, want_task):
+    live = agent_state(record, by_pane, by_cwd)
+    print("run        %s" % record["id"])
+    print("branch     %s   (from %s)" % (record["branch"], record.get("base")))
+    print("repo       %s" % record.get("repo"))
+    print("checkout   %s%s" % (record.get("checkout"),
+                               "" if os.path.isdir(record.get("checkout") or "")
+                               else "   (gone)"))
+    print("agent      %s   pane %s   %s"
+          % (record.get("agent") or "?", record.get("pane") or "?", live))
+    print("dispatched %s" % record.get("dispatched_at"))
+    print("state      %s%s" % (run_state(record),
+                               "" if not record.get("reaped_at")
+                               else " %s — %s" % (record["reaped_at"],
+                                                  record.get("reaped_reason", ""))))
+    print("record     %s" % path)
+    print("")
+
+    if want_task:
+        print(record.get("task") or "(no task recorded)")
+        print("")
+        return
+
+    if record.get("outcome"):
+        sys.stdout.write(outcome_markdown(record))
+        return
+
+    print("No outcome recorded yet. The agent was asked to run:")
+    print("")
+    print("    %s report %s --file %s" % (PROG, record["id"], OUTCOME_DRAFT))
+    print("")
+    if live == "gone":
+        print("Its agent is gone, so nobody is going to. Read the pull request")
+        print("and record what you can yourself — a partial record beats none.")
+    else:
+        # Waiting is the caller's to do, one target at a time and never here:
+        # an orchestrator that blocks on one agent cannot run several, and
+        # running several is the point of dispatching at all.
+        print("It is %s. To be told when it stops, without blocking anything else:"
+              % live)
+        print("")
+        print("    herdr agent wait %s --until idle --until done"
+              % (record.get("pane") or record.get("agent")))
+    print("")
+    print("`%s runs --task %s` prints the task it was given." % (PROG, record["id"]))
+
+
+def cmd_runs(args):
+    directory = runs_dir(args.runs_dir)
+    by_pane, by_cwd = agent_index()
+
+    if args.run or args.task:
+        path, record = resolve_run(directory, args.run, os.getcwd())
+        if args.json:
+            print(json.dumps({"id": record["id"], "record": path,
+                              "state": run_state(record),
+                              "agent_state": agent_state(record, by_pane, by_cwd),
+                              "run": record},
+                             indent=2, sort_keys=True))
+            return
+        show_run(record, path, by_pane, by_cwd, args.task)
+        return
+
+    runs = load_runs(directory)
+    if args.repo:
+        wanted = os.path.realpath(os.path.expanduser(args.repo))
+        runs = [(p, r) for p, r in runs
+                if os.path.realpath(r.get("repo") or "") == wanted]
+    rows = []
+    for path, record in runs:
+        state = run_state(record)
+        if args.outstanding and state != "outstanding":
+            continue
+        rows.append({
+            "id": record["id"],
+            "record": path,
+            "branch": record.get("branch"),
+            "repo": record.get("repo"),
+            "pane": record.get("pane"),
+            "agent": record.get("agent"),
+            "state": state,
+            "agent_state": agent_state(record, by_pane, by_cwd),
+            "dispatched_at": record.get("dispatched_at"),
+            "confidence": (record.get("outcome") or {}).get("confidence"),
+            "pr": (record.get("outcome") or {}).get("pr"),
+        })
+
+    if args.json:
+        print(json.dumps({"runs_dir": directory, "runs": rows},
+                         indent=2, sort_keys=True))
+        return
+
+    if not rows:
+        print("no runs in %s%s" % (directory,
+                                   " that are still outstanding" if args.outstanding else ""))
+        return
+
+    width = max(len(row["id"]) for row in rows)
+    for row in rows:
+        note = row["state"]
+        if row["state"] == "reported" and row["confidence"]:
+            note = "reported, confidence %s" % row["confidence"]
+        print("  %-*s  %-9s  %-11s  %s"
+              % (width, row["id"], row["agent_state"], note, row["branch"]))
+
+    outstanding = [row for row in rows if row["state"] == "outstanding"]
+    print("")
+    if outstanding:
+        print("%d outstanding. Read one with `%s runs <id>`; it says how to wait "
+              "for that one\nwithout waiting on the others."
+              % (len(outstanding), PROG))
+    else:
+        print("nothing outstanding. `%s runs <id>` prints an outcome." % PROG)
 
 
 # --------------------------------------------------------------------- reap --
@@ -1623,6 +2461,11 @@ def main():
                          help="report the result as a herdr notification (for keybinds "
                               "and quick actions, which have no terminal to print to)")
 
+    def runs_option(sub):
+        sub.add_argument("--runs-dir", metavar="DIR",
+                         help="run records directory (default: this plugin's own "
+                              "config dir, which herdr keeps across upgrades)")
+
     save = subparsers.add_parser(
         "save", help="save a space as a project",
         description="Save a live herdr space as a herdr-plus project template.",
@@ -1679,7 +2522,9 @@ def main():
                "choose. A branch the repo's pre-commit hook rejects is reported with "
                "that hook's own words, and everything created is torn down again. The "
                "agent's name is forgotten if herdr restarts, so hold on to the pane id "
-               "it reports — that keeps working.")
+               "it reports — that keeps working. Every dispatch opens a run record and "
+               "tells the agent, in the task, to close it with `report`; ask `runs` what "
+               "came back, and never wait here for it.")
     dispatch.add_argument("task", help="the task, written into the worktree for the agent")
     dispatch.add_argument("--branch", required=True, metavar="NAME",
                           help="branch to create (required; nothing here invents one)")
@@ -1696,16 +2541,74 @@ def main():
     dispatch.add_argument("--prompt", metavar="TEXT",
                           help="what to say to the agent (default: read the task file)")
     dispatch.add_argument("--no-context", action="store_true",
-                          help="write the task alone, without the note saying "
-                               "which worktree and branch it is running in")
+                          help="write the task alone: no note saying which worktree "
+                               "and branch it is running in, and no run record — an "
+                               "agent that was never asked to report an outcome must "
+                               "not leave reap waiting for one")
     dispatch.add_argument("--no-probe", action="store_true",
                           help="skip asking the repo's pre-commit about the branch name")
     dispatch.add_argument("--focus", action="store_true", help="focus the new workspace")
     dispatch.add_argument("--agent-timeout", type=int, default=60000, metavar="MS")
     dispatch.add_argument("--prompt-timeout", type=int, default=60000, metavar="MS")
     dispatch.add_argument("--json", action="store_true", help="machine-readable")
+    runs_option(dispatch)
     shared(dispatch)
     dispatch.set_defaults(func=cmd_dispatch)
+
+    report = subparsers.add_parser(
+        "report", help="record how a dispatched run went",
+        description="Record a dispatched agent's outcome, where it outlives the worktree.",
+        epilog="Run by the agent, not by whoever dispatched it — `dispatch` writes the "
+               "instruction into the task so it does not depend on anybody remembering "
+               "to ask. Start with --template, answer the questions in it, and pass it "
+               "back with --file. With no run named, the run dispatched into the current "
+               "directory is the one meant. Until this is recorded, `reap` will not "
+               "remove the worktree.")
+    report.add_argument("run", nargs="?",
+                        help="run id or branch (default: the run dispatched into cwd)")
+    report.add_argument("--template", action="store_true",
+                        help="print the document this wants, questions included, and stop")
+    report.add_argument("--file", metavar="PATH",
+                        help="read the outcome from this JSON file, or - for stdin")
+    report.add_argument("--summary", metavar="TEXT", help="what you did")
+    report.add_argument("--confidence", metavar="LEVEL",
+                        help="how sure you are: %s" % ", ".join(CONFIDENCE))
+    report.add_argument("--not-done", metavar="TEXT", action="append", default=[],
+                        help="something you did not do or did not check (repeatable)")
+    report.add_argument("--decision", metavar="TEXT", action="append", default=[],
+                        help="something you decided, and why (repeatable)")
+    report.add_argument("--review-first", metavar="TEXT", action="append", default=[],
+                        help="what a reviewer should look at first (repeatable)")
+    report.add_argument("--learned", metavar="TEXT", action="append", default=[],
+                        help="something learned that does not belong in the repo (repeatable)")
+    report.add_argument("--needs-decision", metavar="TEXT", action="append", default=[],
+                        help="something waiting on somebody else (repeatable)")
+    report.add_argument("--pr", metavar="URL",
+                        help="the pull request (default: whatever gh can find)")
+    report.add_argument("--comment", action="store_true",
+                        help="also post the outcome to the pull request with gh")
+    report.add_argument("--json", action="store_true", help="machine-readable")
+    runs_option(report)
+    shared(report)
+    report.set_defaults(func=cmd_report)
+
+    runs = subparsers.add_parser(
+        "runs", help="what was dispatched, and how it went",
+        description="List dispatched runs, or read one agent's recorded outcome.",
+        epilog="Answered from disk and from one `herdr agent list`: it never waits for "
+               "anything, because an orchestrator that blocks on one agent cannot run "
+               "several. `runs <id>` on a run that has not reported prints the "
+               "`herdr agent wait` line that watches that one agent alone.")
+    runs.add_argument("run", nargs="?", help="run id or branch (default: list them all)")
+    runs.add_argument("--outstanding", action="store_true",
+                      help="only runs that have not reported an outcome")
+    runs.add_argument("--task", action="store_true",
+                      help="print the task a run was dispatched with, and nothing else")
+    runs.add_argument("--repo", metavar="PATH", help="only runs dispatched from this repo")
+    runs.add_argument("--json", action="store_true", help="machine-readable")
+    runs_option(runs)
+    shared(runs)
+    runs.set_defaults(func=cmd_runs)
 
     reap = subparsers.add_parser(
         "reap", help="report worktrees that look finished with",
