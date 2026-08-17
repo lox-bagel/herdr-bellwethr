@@ -21,6 +21,10 @@ fi
 
 status=0
 
+# The three unused names are kept for what they document: the line git sends is
+# four fields and only the third is this hook's business, which is easier to see
+# spelled out than as a row of underscores.
+# shellcheck disable=SC2034
 while read -r local_ref local_sha remote_ref remote_sha; do
 	[ -n "$remote_ref" ] || continue
 
