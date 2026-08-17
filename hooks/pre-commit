@@ -1,19 +1,24 @@
 #!/bin/sh
 #
-# pre-commit — refuse to commit on main.
+# pre-commit — refuse to commit on main, or on a branch named off-convention.
 #
 # main is what the PR flow merges into, so a commit landing there directly is
 # either a mistake or a decision worth making on purpose. Branch first:
 #
-#   git switch -c some-branch
+#   git switch -c feat/some-thing
 #
 # A commit already made on main is not lost and not hard to move:
 #
-#   git branch some-branch && git reset --hard origin/main
+#   git branch feat/some-thing && git reset --hard origin/main
+#
+# The branch name is checked here rather than at push time because a name is
+# cheap to change before there are commits on it and awkward after — `git branch
+# -m` is fine locally, but once the branch is pushed and has a pull request the
+# rename has to happen on the remote to keep the PR attached to it.
 #
 # Deliberate exceptions, in the order you should reach for them:
 #
-#   BELLWETHR_ALLOW_MAIN=1 git commit ...    say it once, for this commit
+#   BELLWETHR_SKIP_CHECKS=1 git commit ...   say it once, for this commit
 #   git commit --no-verify ...               skip every hook, this one included
 #
 # This is a local guard, not protection. It lives on this machine only, it is
@@ -23,11 +28,15 @@
 #
 # DELETE THIS HOOK WHEN THE REPO GOES PUBLIC and a ruleset replaces it. The
 # recipe, and why the hooks stop being the right answer at that point, are in
-# the header of hooks/pre-push next to this file.
+# the header of hooks/pre-push next to this file. Note that a ruleset replaces
+# the main check only — branch naming and commit format have no ruleset
+# equivalent, so those parts of these hooks stay.
 
-if [ -n "$BELLWETHR_ALLOW_MAIN" ]; then
+if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
 fi
+
+. "$(dirname "$0")/common.sh"
 
 # A detached HEAD is not main and not the PR flow — rebases and bisects run
 # here, and refusing them would break more than it protects.
@@ -36,9 +45,11 @@ branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
 if [ "$branch" = "main" ]; then
 	echo "pre-commit: refusing to commit on main." >&2
 	echo >&2
-	echo "  git switch -c <branch>            branch, then commit there" >&2
-	echo "  BELLWETHR_ALLOW_MAIN=1 git commit ...   commit here anyway" >&2
+	echo "  git switch -c <type>/<slug>              branch, then commit there" >&2
+	echo "  BELLWETHR_SKIP_CHECKS=1 git commit ...   commit here anyway" >&2
 	exit 1
 fi
+
+bellwethr_check_branch "$branch" "pre-commit" || exit 1
 
 exit 0
