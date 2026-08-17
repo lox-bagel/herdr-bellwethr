@@ -33,17 +33,23 @@ takes back only what it put there.
 
 ## What has to be on the machine
 
-Nothing here is vendored and nothing here has a package manifest, so this is the
-list — this repo, plus every plugin `config/plugins.list` recommends.
-
-### Always
+What a standard Linux or macOS install does not already give you — this repo,
+plus every plugin `config/plugins.list` recommends.
 
 | | Used by | Without it |
 | --- | --- | --- |
 | **herdr** | all of it — this is a herdr plugin and a caller of its CLI | nothing here runs |
-| **git** | `hooks/`; `dev-link` (worktree detection); `dispatch`, `reap` (worktrees, merge state); herdr's own `plugin install`, which shallow-clones; reviewr | no hooks, no dispatch or reap, no plugin installs |
-| **python3** | `herdr-bellwethr`, `dev-link` — standard library only, nothing to `pip install` | neither script runs |
-| **python3 ≥ 3.11** | `tomllib`, to re-parse the TOML `save` writes — herdr-plus fails its whole projects load on one bad file | the check, not the command: older falls back to a regex |
+| **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
+| **node ≥ 23** | drovr, which runs its TypeScript through native type stripping and has no build step | both movers; nothing else |
+| **fzf** | drovr's picker | both movers. Also lost if it is too old — 0.44.1 rejects `--highlight-line` and `input-fg`, and the picker exits |
+| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
+| **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
+| **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
+| **truecolor + Unicode box-drawing** | reviewr's TUI | a readable diff |
+
+The forge CLIs are reviewr's list, not ours: `gh` for GitHub, `glab` for
+GitLab, `az` with the `azure-devops` extension for Azure DevOps. Only `gh` has
+been used against this repo.
 
 herdr's floor is the highest one any installed plugin declares:
 
@@ -53,37 +59,6 @@ herdr's floor is the highest one any installed plugin declares:
 | automatic-rename | ≥ 0.7.1 |
 | drovr | ≥ 0.7.4 |
 | herdr-lazy, reviewr | ≥ 0.7.5 |
-
-### Per plugin
-
-| | Used by | Without it |
-| --- | --- | --- |
-| **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
-| **bash** | reviewr (`herdr/pane.sh`), automatic-rename (3.2 is enough) | same two |
-| **curl** | reviewr's installer (no wget path); herdr-lazy and herdr-plus downloads; herdr-lazy `doctor` | reviewr cannot install; the other two build from source instead |
-| **wget** | accepted in place of curl by herdr-lazy and herdr-plus only | nothing, if curl is there |
-| **node ≥ 23** | drovr, which runs its TypeScript through native type stripping and has no build step | both movers; nothing else |
-| **fzf** | drovr's picker | both movers. Also lost if it is too old — 0.44.1 rejects `--highlight-line` and `input-fg`, and the picker exits |
-| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
-| **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
-| **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
-| **truecolor + Unicode box-drawing** | reviewr's TUI | a readable diff |
-
-### Build toolchains, all avoidable
-
-| | Used by | Without it |
-| --- | --- | --- |
-| **Go** | herdr-plus prefers it — an exact build of the cloned source | nothing: it downloads a release instead |
-| **Rust ≥ 1.78** | herdr-lazy's automatic fallback when no prebuilt matches the platform; reviewr on an unsupported platform or a `plugin link`ed checkout, where you run `cargo install --path .` yourself | nothing on a platform with a prebuilt binary |
-
-### Not dependencies
-
-| | |
-| --- | --- |
-| **brew** | only how this machine installs herdr, node and fzf |
-| **gh**, for this repo | the hooks push you toward the PR flow; nothing here calls it. reviewr is what wants it installed |
-| **fzf**, for this repo | the delete picker draws its own list against `termios`, so it can run in a pane herdr tears down on exit |
-| **tar**, **sha256sum**/**shasum**, **awk**, **sed**, **mktemp** | used by the installers and drovr's picker; standard on Linux and macOS |
 
 ## Working on it
 
