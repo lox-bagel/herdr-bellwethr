@@ -53,10 +53,11 @@ the list. What the code in this repo needs:
   the one that has to be installed.
 
 Three things you will have anyway are not dependencies of this code. `gh` is the
-pull-request flow the hooks push you toward, not something they call. `brew` is
-only how this machine happens to install herdr, node and fzf. `fzf` belongs to
-drovr — the delete picker here draws its own fuzzy list against `termios`, so
-that it can run in a pane herdr tears down the moment it exits.
+pull-request flow the hooks push you toward, not something they call — reviewr
+below is what actually wants it installed. `brew` is only how this machine
+happens to install herdr, node and fzf. `fzf` belongs to drovr — the delete
+picker here draws its own fuzzy list against `termios`, so that it can run in a
+pane herdr tears down the moment it exits.
 
 ### What the recommended plugins want
 
@@ -68,16 +69,23 @@ you skip its dependencies with it.
   release binary and check it (`curl` or `wget`, `tar`, `shasum`/`sha256sum`),
   falling back to `cargo` only when no release matches the platform. herdr-plus
   runs it the other way — `go build` when Go is there, download when it is not.
+- **herdr-lazy** reaches for `curl` or `wget` once more after that, in `doctor`,
+  which asks GitHub whether each entry in the list still resolves. With neither
+  it reports that it could not ask rather than that the repository is gone, so
+  this one costs you a check and not a command.
 - **reviewr** then needs `bash`, `jq` and `git` at runtime: its `herdr/pane.sh`
   reads every field of its own config and every herdr reply through jq, and
-  refuses to open a pane outside a git repository.
+  refuses to open a pane outside a git repository. Its PR tab reads the branch's
+  pull request through whichever forge CLI the remote's host calls for —
+  `gh`, `glab` or `az` — and that CLI has to be authenticated. Only that one tab
+  needs it; without it the tab says so and the rest of reviewr carries on.
 - **automatic-rename** needs `bash` and `jq`. Nothing is built or downloaded.
 - **drovr** needs **node >= 23** and **fzf**. It ships TypeScript with no build
   step and relies on node's native type stripping to run it, which is where the
   version comes from. fzf draws the picker, and a distribution's fzf can be too
-  old to: 0.44.1 rejects both `--highlight-line` and drovr's `input-fg` colour,
-  and the picker exits rather than opening. drovr also wants herdr >= 0.7.4 for
-  floating popups.
+  old for it: 0.44.1 rejects both `--highlight-line` and drovr's `input-fg`
+  colour, and the picker exits rather than opening. drovr also wants
+  herdr >= 0.7.4 for floating popups.
 
 ## Working on it
 
