@@ -1,0 +1,101 @@
+#!/bin/sh
+#
+# pre-push — refuse to push main, or to create an off-convention branch on the
+# remote.
+#
+# The pre-commit hook next to this one stops main growing commits locally; this
+# one stops main moving on the remote, including the force push and the delete,
+# which are the two that lose work rather than merely adding it. Open a pull
+# request instead.
+#
+# git feeds one line per ref being pushed on stdin:
+#
+#   <local ref> <local sha> <remote ref> <remote sha>
+#
+# The remote ref is the one that matters — a local branch named anything at all
+# can be pushed to refs/heads/main, and that is exactly the case a check on the
+# current branch would miss. It is also the name the pull request will carry, so
+# it is the name the convention applies to: `git push origin feat/x:whatever`
+# puts `whatever` on the remote no matter what the local branch is called.
+#
+# Deliberate exceptions:
+#
+#   BELLWETHR_SKIP_CHECKS=1 git push ...   say it once, for this push
+#   git push --no-verify ...               skip every hook, this one included
+#
+# Same caveat as pre-commit: local guard, not protection. It is off in a clone
+# that has not set core.hooksPath.
+#
+# DELETE THE MAIN CHECK WHEN THE REPO GOES PUBLIC. Rulesets are free on public
+# repositories and refused on a private one under a personal account — the API
+# answers "Upgrade to GitHub Pro or make this repository public to enable this
+# feature" with a 403. A ruleset is enforced by the remote, so it holds for
+# every clone, every machine, and anyone else who ends up with push rights,
+# none of which a hook on one laptop can claim. Once the repo is public:
+#
+#   gh api -X POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
+#   {
+#     "name": "main: pull request only",
+#     "target": "branch",
+#     "enforcement": "active",
+#     "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+#     "rules": [
+#       {"type": "deletion"},
+#       {"type": "non_fast_forward"},
+#       {"type": "pull_request", "parameters": {
+#         "required_approving_review_count": 0,
+#         "dismiss_stale_reviews_on_push": false,
+#         "require_code_owner_review": false,
+#         "require_last_push_approval": false,
+#         "required_review_thread_resolution": true,
+#         "allowed_merge_methods": ["merge", "squash", "rebase"]
+#       }},
+#       {"type": "required_status_checks", "parameters": {
+#         "strict_required_status_checks_policy": false,
+#         "required_status_checks": [{"context": "pr-title"}]
+#       }}
+#     ]
+#   }
+#   JSON
+#
+# Zero approvals is deliberate: it still requires a pull request to exist, and
+# GitHub does not let you approve your own, so any higher number would leave a
+# solo maintainer unable to merge. Raise it when there is somebody to ask. The
+# required check is what finally gives the pr-title workflow teeth — until then
+# it reports and nothing acts on the report.
+#
+# The branch-name check below has no ruleset equivalent and stays either way.
+# When the main check goes, drop the refs/heads/main branch of this hook rather
+# than the file.
+
+if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
+	exit 0
+fi
+
+. "$(dirname "$0")/common.sh"
+
+remote_url=$(git remote get-url --push "$1" 2>/dev/null || echo "$1")
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+	[ -n "$remote_ref" ] || continue
+
+	if [ "$remote_ref" = "refs/heads/main" ]; then
+		echo "pre-push: refusing to push $remote_ref on $remote_url." >&2
+		echo >&2
+		echo "  git push -u origin <type>/<slug>       push a branch and open a PR" >&2
+		echo "  BELLWETHR_SKIP_CHECKS=1 git push       push main anyway" >&2
+		status=1
+		continue
+	fi
+
+	# Tags and other non-branch refs are not what this convention is about.
+	case "$remote_ref" in
+	refs/heads/*) ;;
+	*) continue ;;
+	esac
+
+	bellwethr_check_branch "${remote_ref#refs/heads/}" "pre-push" || status=1
+done
+
+exit "$status"
