@@ -33,59 +33,57 @@ takes back only what it put there.
 
 ## What has to be on the machine
 
-Nothing here is vendored, and nothing here has a package manifest, so this is
-the list. What the code in this repo needs:
+Nothing here is vendored and nothing here has a package manifest, so this is the
+list — this repo, plus every plugin `config/plugins.list` recommends.
 
-- **herdr** — everything here is either a herdr plugin or a caller of its CLI.
-  `herdr-plugin.toml` declares `min_herdr_version = "0.7.0"`, which is the floor
-  for this plugin alone; the recommended set below asks for more, so 0.7.5 is
-  the number to have if you install those too.
-- **python3** — `herdr-bellwethr` and `dev-link` are Python, standard library
-  only: there is nothing to `pip install`. `tomllib` (3.11+) re-parses the TOML
-  `save` generates, because herdr-plus fails its whole projects load on one bad
-  file; an older python3 falls back to a regex and loses the check, not the
-  command.
-- **git** — `hooks/` are git hooks; `dev-link` asks git whether it is in a
-  linked worktree before claiming an install's symlinks; `dispatch` and `reap`
-  create and remove worktrees and read what has merged.
-- **a coding agent** — only for `dispatch`, which asks herdr to start one
-  (`--kind claude` by default). herdr launches it, so whichever kind you name is
-  the one that has to be installed.
+### Always
 
-Three things you will have anyway are not dependencies of this code. `gh` is the
-pull-request flow the hooks push you toward, not something they call — reviewr
-below is what actually wants it installed. `brew` is only how this machine
-happens to install herdr, node and fzf. `fzf` belongs to drovr — the delete
-picker here draws its own fuzzy list against `termios`, so that it can run in a
-pane herdr tears down the moment it exits.
+| | Used by | Without it |
+| --- | --- | --- |
+| **herdr** | all of it — this is a herdr plugin and a caller of its CLI | nothing here runs |
+| **git** | `hooks/`; `dev-link` (worktree detection); `dispatch`, `reap` (worktrees, merge state); herdr's own `plugin install`, which shallow-clones; reviewr | no hooks, no dispatch or reap, no plugin installs |
+| **python3** | `herdr-bellwethr`, `dev-link` — standard library only, nothing to `pip install` | neither script runs |
+| **python3 ≥ 3.11** | `tomllib`, to re-parse the TOML `save` writes — herdr-plus fails its whole projects load on one bad file | the check, not the command: older falls back to a regex |
 
-### What the recommended plugins want
+herdr's floor is the highest one any installed plugin declares:
 
-`config/plugins.list` is a recommendation, not a requirement. Skip a plugin and
-you skip its dependencies with it.
+| | |
+| --- | --- |
+| herdr-bellwethr, herdr-plus | ≥ 0.7.0 |
+| automatic-rename | ≥ 0.7.1 |
+| drovr | ≥ 0.7.4 |
+| herdr-lazy, reviewr | ≥ 0.7.5 |
 
-- **herdr-lazy** and **reviewr** (Rust) and **herdr-plus** (Go) each build on
-  install, and each avoids needing a toolchain: the first two download a
-  release binary and check it (`curl` or `wget`, `tar`, `shasum`/`sha256sum`),
-  falling back to `cargo` only when no release matches the platform. herdr-plus
-  runs it the other way — `go build` when Go is there, download when it is not.
-- **herdr-lazy** reaches for `curl` or `wget` once more after that, in `doctor`,
-  which asks GitHub whether each entry in the list still resolves. With neither
-  it reports that it could not ask rather than that the repository is gone, so
-  this one costs you a check and not a command.
-- **reviewr** then needs `bash`, `jq` and `git` at runtime: its `herdr/pane.sh`
-  reads every field of its own config and every herdr reply through jq, and
-  refuses to open a pane outside a git repository. Its PR tab reads the branch's
-  pull request through whichever forge CLI the remote's host calls for —
-  `gh`, `glab` or `az` — and that CLI has to be authenticated. Only that one tab
-  needs it; without it the tab says so and the rest of reviewr carries on.
-- **automatic-rename** needs `bash` and `jq`. Nothing is built or downloaded.
-- **drovr** needs **node >= 23** and **fzf**. It ships TypeScript with no build
-  step and relies on node's native type stripping to run it, which is where the
-  version comes from. fzf draws the picker, and a distribution's fzf can be too
-  old for it: 0.44.1 rejects both `--highlight-line` and drovr's `input-fg`
-  colour, and the picker exits rather than opening. drovr also wants
-  herdr >= 0.7.4 for floating popups.
+### Per plugin
+
+| | Used by | Without it |
+| --- | --- | --- |
+| **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
+| **bash** | reviewr (`herdr/pane.sh`), automatic-rename (3.2 is enough) | same two |
+| **curl** | reviewr's installer (no wget path); herdr-lazy and herdr-plus downloads; herdr-lazy `doctor` | reviewr cannot install; the other two build from source instead |
+| **wget** | accepted in place of curl by herdr-lazy and herdr-plus only | nothing, if curl is there |
+| **node ≥ 23** | drovr, which runs its TypeScript through native type stripping and has no build step | both movers; nothing else |
+| **fzf** | drovr's picker | both movers. Also lost if it is too old — 0.44.1 rejects `--highlight-line` and `input-fg`, and the picker exits |
+| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
+| **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
+| **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
+| **truecolor + Unicode box-drawing** | reviewr's TUI | a readable diff |
+
+### Build toolchains, all avoidable
+
+| | Used by | Without it |
+| --- | --- | --- |
+| **Go** | herdr-plus prefers it — an exact build of the cloned source | nothing: it downloads a release instead |
+| **Rust ≥ 1.78** | herdr-lazy's automatic fallback when no prebuilt matches the platform; reviewr on an unsupported platform or a `plugin link`ed checkout, where you run `cargo install --path .` yourself | nothing on a platform with a prebuilt binary |
+
+### Not dependencies
+
+| | |
+| --- | --- |
+| **brew** | only how this machine installs herdr, node and fzf |
+| **gh**, for this repo | the hooks push you toward the PR flow; nothing here calls it. reviewr is what wants it installed |
+| **fzf**, for this repo | the delete picker draws its own list against `termios`, so it can run in a pane herdr tears down on exit |
+| **tar**, **sha256sum**/**shasum**, **awk**, **sed**, **mktemp** | used by the installers and drovr's picker; standard on Linux and macOS |
 
 ## Working on it
 
