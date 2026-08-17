@@ -1,0 +1,4 @@
+name = "Reviewr: toggle pane   "
+description = "(prefix+shift+v): Toggle the reviewr diff pane."
+type = "command"
+command = "herdr plugin action invoke persiyanov.reviewr.toggle"

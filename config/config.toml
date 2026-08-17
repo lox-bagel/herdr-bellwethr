@@ -41,6 +41,19 @@ type = "shell"
 command = "herdr-bellwethr save --notify --force"
 description = "Herdr Plus: save project"
 
+# reviewr's diff pane, over the repo the focused pane is sitting in. Toggle
+# rather than open: the pane is a split, and the second press is how you get the
+# room back. reviewr also opens itself for a freshly created worktree, so this
+# is for the reviews that do not start with one.
+#
+# shift+v because v alone splits a pane vertically, and reviewr's own suggestion
+# of cmd+r is a chord many terminals eat before herdr sees it.
+[[keys.command]]
+key = "prefix+shift+v"
+type = "plugin_action"
+command = "persiyanov.reviewr.toggle"
+description = "reviewr: toggle diff pane"
+
 [theme]
 name = "terminal"
 auto_switch = false
