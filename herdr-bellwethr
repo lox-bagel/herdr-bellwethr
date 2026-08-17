@@ -36,6 +36,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 # herdr-plus caps a tab at 4 panes (maxPanesPerTab in its project.go) and only
 # understands these two split directions.
@@ -1090,6 +1091,31 @@ def live_agent_names():
                for a in herdr("agent", "list").get("agents", []))
 
 
+def start_agent(alias, kind, pane_id, timeout_ms):
+    """Start the agent, waiting out a pane that is not a shell prompt yet.
+
+    A pane herdr has just built is not immediately somewhere an agent can be
+    started in: the shell has to reach its prompt first, and until it does
+    `agent start` refuses with agent_pane_busy. Its own --timeout does not cover
+    this — that waits for the *agent* to become ready once it has been launched,
+    which is a later problem than getting to launch it at all.
+
+    So the wait is here, and it is a retry of the real call rather than a poll of
+    something adjacent: herdr already knows what "an available shell" means, and
+    a readiness test written here would be a second opinion that can disagree.
+    """
+    deadline = time.monotonic() + max(timeout_ms, 1000) / 1000.0
+    while True:
+        result, err = herdr_quiet(
+            "agent", "start", alias, "--kind", kind,
+            "--pane", pane_id, "--timeout", str(timeout_ms))
+        if result or "agent_pane_busy" not in err:
+            return result, err
+        if time.monotonic() >= deadline:
+            return {}, err + " — the pane never reached a shell prompt"
+        time.sleep(0.5)
+
+
 def probe_branch(checkout, branch):
     """Ask the repo's own pre-commit whether it will accept this branch name.
 
@@ -1140,10 +1166,11 @@ def teardown(workspace_id, repo, branch, checkout):
     message explaining what actually went wrong.
     """
     if workspace_id:
-        try:
-            herdr_quiet("worktree", "remove", "--workspace", workspace_id)
-        except Exception:
-            pass
+        herdr_quiet("worktree", "remove", "--workspace", workspace_id)
+        # Removing the worktree does not always take the workspace with it, and
+        # a workspace left pointing at a deleted checkout is worse than the one
+        # we were rolling back — it shows in the sidebar and cannot be reopened.
+        herdr_quiet("workspace", "close", workspace_id)
     if checkout and os.path.isdir(checkout):
         git(repo, "worktree", "remove", "--force", checkout)
     git(repo, "worktree", "prune")
@@ -1152,16 +1179,38 @@ def teardown(workspace_id, repo, branch, checkout):
 
 
 def herdr_quiet(*args):
-    """herdr(), for calls whose failure is not worth dying over."""
+    """herdr(), for calls whose failure is not worth dying over.
+
+    Returns (result, error). The error half exists because herdr reports
+    failures in the JSON body — a call that fails and a call that succeeds with
+    nothing to say both leave an empty result, and telling the caller only that
+    it "returned nothing" throws away the sentence explaining why.
+    """
     try:
         proc = subprocess.run(
             ("herdr",) + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError:
-        return {}
-    try:
-        return json.loads(proc.stdout.decode("utf-8", "replace")).get("result", {})
-    except ValueError:
-        return {}
+    except OSError as exc:
+        return {}, str(exc)
+
+    # herdr answers on stdout when it succeeds and on stderr when it does not,
+    # and both are JSON, so the body is worth parsing wherever it arrives.
+    for stream in (proc.stdout, proc.stderr):
+        text = stream.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if "error" in payload:
+            e = payload["error"]
+            return {}, "%s (%s)" % (e.get("message", "failed"), e.get("code", "?"))
+        if "result" in payload:
+            return payload["result"], ""
+
+    text = proc.stderr.decode("utf-8", "replace").strip() \
+        or proc.stdout.decode("utf-8", "replace").strip()
+    return {}, text[:400] or "no output"
 
 
 def fail(args, stage, message, detail=""):
@@ -1230,12 +1279,11 @@ def cmd_dispatch(args):
         teardown(workspace_id, repo, branch, checkout)
         fail(args, "agent", "not a usable agent name: %r" % alias)
 
-    start = herdr_quiet("agent", "start", alias, "--kind", args.kind,
-                        "--pane", pane_id, "--timeout", str(args.agent_timeout))
+    start, err = start_agent(alias, args.kind, pane_id, args.agent_timeout)
     if not start:
         teardown(workspace_id, repo, branch, checkout)
         fail(args, "agent", "%s did not come up in the new pane" % args.kind,
-             "herdr agent start returned nothing. Check `herdr agent explain`.")
+             err or "herdr agent start said nothing. Try `herdr agent explain`.")
 
     prompt = args.prompt or (
         "Read %s in the repository root and start on it." % args.task_file)
@@ -1243,8 +1291,9 @@ def cmd_dispatch(args):
     # Deliberately not torn down past this point. The agent is up and the task
     # file is written, so a prompt that fails to land is something to retry by
     # hand — throwing the worktree away would take the agent's session with it.
-    submitted = herdr_quiet("agent", "prompt", alias, prompt, "--wait",
-                            "--until", "working", "--timeout", str(args.prompt_timeout))
+    submitted, prompt_err = herdr_quiet(
+        "agent", "prompt", alias, prompt, "--wait",
+        "--until", "working", "--timeout", str(args.prompt_timeout))
 
     result = {
         "ok": True,
@@ -1257,6 +1306,7 @@ def cmd_dispatch(args):
         "kind": args.kind,
         "task_file": task_path,
         "prompted": bool(submitted),
+        "prompt_error": prompt_err,
     }
 
     if args.json:
@@ -1267,8 +1317,8 @@ def cmd_dispatch(args):
         print("  workspace  %s   pane %s" % (workspace_id, pane_id))
         print("  task       %s" % task_path)
         if not submitted:
-            print("  ! the prompt did not land — submit it with "
-                  "`herdr agent prompt %s ...`" % alias)
+            print("  ! the prompt did not land: %s" % (prompt_err or "no reason given"))
+            print("    submit it with `herdr agent prompt %s ...`" % alias)
 
     notify("Herdr Bellwethr: dispatched", "%s → %s" % (branch, alias))
 
@@ -1387,9 +1437,9 @@ def cmd_reap(args):
 
     # Which checkout a workspace is sitting in, so a busy agent is not evicted.
     workspaces = {}
-    panes = herdr_quiet("pane", "list").get("panes", [])
+    panes = herdr_quiet("pane", "list")[0].get("panes", [])
     states = {w.get("workspace_id"): w.get("agent_status")
-              for w in herdr_quiet("workspace", "list").get("workspaces", [])}
+              for w in herdr_quiet("workspace", "list")[0].get("workspaces", [])}
     for pane in panes:
         cwd = pane.get("cwd")
         if cwd:
@@ -1435,6 +1485,7 @@ def cmd_reap(args):
         workspace_id = workspace_of.get(path)
         if workspace_id:
             herdr_quiet("worktree", "remove", "--workspace", workspace_id)
+            herdr_quiet("workspace", "close", workspace_id)
         if os.path.isdir(path):
             git(repo, "worktree", "remove", path)
         git(repo, "worktree", "prune")
