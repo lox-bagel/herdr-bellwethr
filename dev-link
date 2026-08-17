@@ -65,6 +65,7 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 
 PLUS_ID = "cloudmanic.herdr-plus"
 LAZY_ID = "herdr-lazy"
+REVIEWR_ID = "persiyanov.reviewr"
 
 
 def warn(msg):
@@ -215,6 +216,13 @@ def targets(config_dir):
     pairs.append((
         os.path.join(REPO, "config", "plugins.list"),
         os.path.join(plugin_config_dir(LAZY_ID, config_dir), "plugins.list"),
+    ))
+
+    # reviewr's own config. A plugin we recommend and bind a key to, so the
+    # settings that make that key land on something useful travel with it.
+    pairs.append((
+        os.path.join(REPO, "config", "reviewr.toml"),
+        os.path.join(plugin_config_dir(REVIEWR_ID, config_dir), "config.toml"),
     ))
 
     return pairs
