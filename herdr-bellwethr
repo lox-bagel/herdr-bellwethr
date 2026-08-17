@@ -1244,6 +1244,19 @@ def task_document(args, repo, checkout, branch, workspace_id, pane_id):
         "here, and refusing is usually the correct behaviour rather than a fault\n"
         "to work around. If the task asks for something that only the primary\n"
         "checkout can do, say so rather than forcing it.\n"
+        "\n"
+        "Workspaces are numbered as well, and people refer to them that way —\n"
+        "\"agent 3\", \"the one in 4\". `herdr workspace list` is where that\n"
+        "resolves: every workspace reports a `number`, the `workspace_id` above,\n"
+        "and a `worktree` object with `checkout_path` and `is_linked_worktree`.\n"
+        "The label carries the number too, as `[n] <name>`. The command runs\n"
+        "from in here.\n"
+        "\n"
+        "The number is positional: close a workspace and the ones after it are\n"
+        "renumbered, so it names a workspace in conversation and nowhere else.\n"
+        "Nothing above records one for that reason. Look a number up when you\n"
+        "are given one rather than assuming which workspace is meant, and write\n"
+        "down the workspace id or the branch, never the number.\n"
         % (PROG, checkout, repo, branch, args.base, workspace_id, pane_id)
     )
 
