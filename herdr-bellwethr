@@ -16,7 +16,7 @@
 # never ~/.config/herdr/session.json — that file is a persistence detail and
 # lags the running session.
 
-"""Save, list, and delete herdr-plus project templates."""
+"""Save herdr-plus projects, and dispatch agents into worktrees."""
 
 import argparse
 import json
@@ -49,7 +49,7 @@ PROG = "herdr-bellwethr"
 NOTIFY = False
 
 # main() replaces this with one naming the subcommand.
-FAIL_TITLE = "Herdr Plus: failed"
+FAIL_TITLE = "Herdr Bellwethr: failed"
 
 
 def notify(title, body):
@@ -1081,20 +1081,6 @@ def probe_branch(checkout, branch):
     return proc.returncode == 0, output
 
 
-def workspace_for_repo(repo):
-    """An existing workspace whose panes sit in `repo`, or None.
-
-    workspace list does not report a working directory — only panes do — so the
-    mapping is built from the pane side.
-    """
-    prefix = os.path.realpath(repo) + os.sep
-    for pane in herdr("pane", "list").get("panes", []):
-        cwd = pane.get("cwd") or ""
-        if cwd and (os.path.realpath(cwd) + os.sep).startswith(prefix):
-            return pane.get("workspace_id")
-    return None
-
-
 def teardown(workspace_id, repo, branch, checkout):
     """Undo a dispatch that failed after it had already built something.
 
@@ -1519,7 +1505,7 @@ def cmd_reap(args):
 def main():
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="Save, list, and delete herdr-plus project templates.",
+        description="Save herdr-plus projects, and dispatch agents into worktrees.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1643,7 +1629,7 @@ def main():
 
     global NOTIFY, FAIL_TITLE
     NOTIFY = args.notify
-    FAIL_TITLE = "Herdr Plus: %s failed" % args.command
+    FAIL_TITLE = "Herdr Bellwethr: %s failed" % args.command
 
     args.func(args)
 
