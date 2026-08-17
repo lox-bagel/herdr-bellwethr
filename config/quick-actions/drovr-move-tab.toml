@@ -1,0 +1,4 @@
+name = "Drovr: move tab        "
+description = "(prefix+shift+m): Move the focused tab to another workspace."
+type = "command"
+command = "herdr plugin action invoke drovr.move-tab"
