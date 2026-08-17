@@ -1,0 +1,44 @@
+#!/bin/sh
+#
+# pre-commit — refuse to commit on main.
+#
+# main is what the PR flow merges into, so a commit landing there directly is
+# either a mistake or a decision worth making on purpose. Branch first:
+#
+#   git switch -c some-branch
+#
+# A commit already made on main is not lost and not hard to move:
+#
+#   git branch some-branch && git reset --hard origin/main
+#
+# Deliberate exceptions, in the order you should reach for them:
+#
+#   BELLWETHR_ALLOW_MAIN=1 git commit ...    say it once, for this commit
+#   git commit --no-verify ...               skip every hook, this one included
+#
+# This is a local guard, not protection. It lives on this machine only, it is
+# off in a clone that has not set core.hooksPath, and --no-verify walks past it.
+# Real enforcement is a branch ruleset on the remote, which the repo being
+# private on a personal account currently rules out.
+#
+# DELETE THIS HOOK WHEN THE REPO GOES PUBLIC and a ruleset replaces it. The
+# recipe, and why the hooks stop being the right answer at that point, are in
+# the header of hooks/pre-push next to this file.
+
+if [ -n "$BELLWETHR_ALLOW_MAIN" ]; then
+	exit 0
+fi
+
+# A detached HEAD is not main and not the PR flow — rebases and bisects run
+# here, and refusing them would break more than it protects.
+branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
+
+if [ "$branch" = "main" ]; then
+	echo "pre-commit: refusing to commit on main." >&2
+	echo >&2
+	echo "  git switch -c <branch>            branch, then commit there" >&2
+	echo "  BELLWETHR_ALLOW_MAIN=1 git commit ...   commit here anyway" >&2
+	exit 1
+fi
+
+exit 0
