@@ -1,0 +1,87 @@
+# The checks that apply to any repository, whatever it is written in: file
+# hygiene, the parsers and linters for the languages this one actually contains,
+# and the rules that keep the workflows themselves from being the way in.
+#
+# The checks are shell scripts in .github/checks/ rather than run: blocks in
+# here. Three reasons, in order of how often they matter: they can be run before
+# pushing, so the first person to learn about a stray executable bit is not the
+# pull request; a script gets linted by lint.sh like the rest of the shell in
+# this repository, and a run: block never is; and a workflow that is three lines
+# per job is a workflow whose logic can be moved somewhere else without being
+# rewritten.
+#
+# Each check is its own job, so a failure in one still lets the other two say
+# what they found, and each reports its own status check that a ruleset can
+# require separately. They report; nothing is required yet — see the pull
+# request that added this file for the gh api call that makes them required and
+# for what it would do to the pull requests already open.
+#
+# No actions at all, not even a pinned actions/checkout: the repository is
+# public, so its pull request refs can be fetched without a token, and the whole
+# of what checkout would do here is four git commands. Nothing is trusted that
+# is not in this repository. If a maintainer would rather have the action back,
+# replace the fetch step with actions/checkout pinned to a full commit SHA —
+# checks/workflows.sh enforces that pinning, so nothing else has to be
+# remembered.
+
+name: pr-checks
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the pull request head
+        env:
+          # Through the environment, never interpolated into the script: the
+          # same rule pr-title.yml is written around. The repository name is
+          # not attacker-controlled, but a script that only sometimes follows
+          # the rule teaches the exception.
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git fetch -q --depth 1 origin "refs/pull/${PR_NUMBER}/head"
+          git checkout -q FETCH_HEAD
+      - name: Check file hygiene
+        run: .github/checks/hygiene.sh
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the pull request head
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git fetch -q --depth 1 origin "refs/pull/${PR_NUMBER}/head"
+          git checkout -q FETCH_HEAD
+      - name: Parse and lint every language in the repository
+        run: .github/checks/lint.sh
+
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the pull request head
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git init -q .
+          git remote add origin "$REPO_URL"
+          git fetch -q --depth 1 origin "refs/pull/${PR_NUMBER}/head"
+          git checkout -q FETCH_HEAD
+      - name: Check the workflows themselves
+        run: .github/checks/workflows.sh
