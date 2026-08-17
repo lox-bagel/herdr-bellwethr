@@ -1,0 +1,7 @@
+name = "Agent: install commands"
+description = "(unset):          Register /dispatch and /reap with an agent."
+type = "form"
+command = "herdr-bellwethr agent-commands install --kind '{{.Value}}' --notify"
+
+[form]
+prompt = "Agent kind (claude, gemini, agy, codex, cursor, opencode)"
