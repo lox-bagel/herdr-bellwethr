@@ -1,9 +1,11 @@
 #!/bin/sh
 #
-# pre-commit — refuse to commit on main, or on a branch named off-convention.
+# pre-commit — refuse to commit on a branch named off-convention.
 #
 # The name is checked at commit time, not push time: once a branch is pushed and
 # has a pull request, renaming it has to happen on the remote or the PR closes.
+#
+# main is the ruleset's job now, not this hook's — see hooks/pre-push.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -11,17 +13,9 @@ fi
 
 . "$(dirname "$0")/common.sh"
 
-# Detached HEAD is where rebases and bisects run; refusing them would break more
-# than it protects.
+# Detached HEAD has no branch name to hold to a convention, and rebases and
+# bisects run there.
 branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
-
-if [ "$branch" = "main" ]; then
-	echo "pre-commit: refusing to commit on main." >&2
-	echo >&2
-	echo "  git switch -c <type>/<slug>              branch, then commit there" >&2
-	echo "  BELLWETHR_SKIP_CHECKS=1 git commit ...   commit here anyway" >&2
-	exit 1
-fi
 
 bellwethr_check_branch "$branch" "pre-commit" || exit 1
 
