@@ -31,6 +31,54 @@ machine accumulates is deliberately not:
 Installing the recommended plugins leaves them installed. Removing this one
 takes back only what it put there.
 
+## What has to be on the machine
+
+Nothing here is vendored, and nothing here has a package manifest, so this is
+the list. What the code in this repo needs:
+
+- **herdr** — everything here is either a herdr plugin or a caller of its CLI.
+  `herdr-plugin.toml` declares `min_herdr_version = "0.7.0"`, which is the floor
+  for this plugin alone; the recommended set below asks for more, so 0.7.5 is
+  the number to have if you install those too.
+- **python3** — `herdr-bellwethr` and `dev-link` are Python, standard library
+  only: there is nothing to `pip install`. `tomllib` (3.11+) re-parses the TOML
+  `save` generates, because herdr-plus fails its whole projects load on one bad
+  file; an older python3 falls back to a regex and loses the check, not the
+  command.
+- **git** — `hooks/` are git hooks; `dev-link` asks git whether it is in a
+  linked worktree before claiming an install's symlinks; `dispatch` and `reap`
+  create and remove worktrees and read what has merged.
+- **a coding agent** — only for `dispatch`, which asks herdr to start one
+  (`--kind claude` by default). herdr launches it, so whichever kind you name is
+  the one that has to be installed.
+
+Three things you will have anyway are not dependencies of this code. `gh` is the
+pull-request flow the hooks push you toward, not something they call. `brew` is
+only how this machine happens to install herdr, node and fzf. `fzf` belongs to
+drovr — the delete picker here draws its own fuzzy list against `termios`, so
+that it can run in a pane herdr tears down the moment it exits.
+
+### What the recommended plugins want
+
+`config/plugins.list` is a recommendation, not a requirement. Skip a plugin and
+you skip its dependencies with it.
+
+- **herdr-lazy** and **reviewr** (Rust) and **herdr-plus** (Go) each build on
+  install, and each avoids needing a toolchain: the first two download a
+  release binary and check it (`curl` or `wget`, `tar`, `shasum`/`sha256sum`),
+  falling back to `cargo` only when no release matches the platform. herdr-plus
+  runs it the other way — `go build` when Go is there, download when it is not.
+- **reviewr** then needs `bash`, `jq` and `git` at runtime: its `herdr/pane.sh`
+  reads every field of its own config and every herdr reply through jq, and
+  refuses to open a pane outside a git repository.
+- **automatic-rename** needs `bash` and `jq`. Nothing is built or downloaded.
+- **drovr** needs **node >= 23** and **fzf**. It ships TypeScript with no build
+  step and relies on node's native type stripping to run it, which is where the
+  version comes from. fzf draws the picker, and a distribution's fzf can be too
+  old to: 0.44.1 rejects both `--highlight-line` and drovr's `input-fg` colour,
+  and the picker exits rather than opening. drovr also wants herdr >= 0.7.4 for
+  floating popups.
+
 ## Working on it
 
 ```sh
