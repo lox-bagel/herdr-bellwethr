@@ -1,20 +1,20 @@
 #!/bin/sh
 #
-# pre-commit — refuse to commit on main, or on a branch named off-convention.
-#
-# main is what the PR flow merges into, so a commit landing there directly is
-# either a mistake or a decision worth making on purpose. Branch first:
-#
-#   git switch -c feat/some-thing
-#
-# A commit already made on main is not lost and not hard to move:
-#
-#   git branch feat/some-thing && git reset --hard origin/main
+# pre-commit — refuse to commit on a branch named off-convention.
 #
 # The branch name is checked here rather than at push time because a name is
 # cheap to change before there are commits on it and awkward after — `git branch
 # -m` is fine locally, but once the branch is pushed and has a pull request the
 # rename has to happen on the remote to keep the PR attached to it.
+#
+# main is no longer refused here. The repository is public, so a ruleset can
+# finally do that job on the remote — see the header of hooks/pre-push — and it
+# does it for every clone and every machine rather than for whoever happens to
+# have core.hooksPath set. A commit made on main by mistake now simply has
+# nowhere to go, which is the same outcome reached later and more honestly.
+# Moving one is still not hard:
+#
+#   git branch feat/some-thing && git reset --hard origin/main
 #
 # Deliberate exceptions, in the order you should reach for them:
 #
@@ -23,14 +23,9 @@
 #
 # This is a local guard, not protection. It lives on this machine only, it is
 # off in a clone that has not set core.hooksPath, and --no-verify walks past it.
-# Real enforcement is a branch ruleset on the remote, which the repo being
-# private on a personal account currently rules out.
-#
-# DELETE THIS HOOK WHEN THE REPO GOES PUBLIC and a ruleset replaces it. The
-# recipe, and why the hooks stop being the right answer at that point, are in
-# the header of hooks/pre-push next to this file. Note that a ruleset replaces
-# the main check only — branch naming and commit format have no ruleset
-# equivalent, so those parts of these hooks stay.
+# That is exactly why the main guard moved to the remote the moment it could.
+# Branch naming — and commit format, in hooks/commit-msg — have no ruleset
+# equivalent, so they stay here and keep that caveat.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -38,17 +33,9 @@ fi
 
 . "$(dirname "$0")/common.sh"
 
-# A detached HEAD is not main and not the PR flow — rebases and bisects run
-# here, and refusing them would break more than it protects.
+# A detached HEAD has no branch name to hold to a convention — rebases and
+# bisects run here, and complaining about them would break more than it helps.
 branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
-
-if [ "$branch" = "main" ]; then
-	echo "pre-commit: refusing to commit on main." >&2
-	echo >&2
-	echo "  git switch -c <type>/<slug>              branch, then commit there" >&2
-	echo "  BELLWETHR_SKIP_CHECKS=1 git commit ...   commit here anyway" >&2
-	exit 1
-fi
 
 bellwethr_check_branch "$branch" "pre-commit" || exit 1
 
