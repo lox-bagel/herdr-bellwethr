@@ -1036,6 +1036,13 @@ or two more where the subject cannot carry the point on its own. Not
 paragraphs, and not a retelling of the diff — the diff is already there. The
 branch is rebased onto the base, so each commit is kept exactly as written.
 
+The branch survives the merge. `gh pr merge --rebase` on its own leaves it
+alone; `--delete-branch` does not, and neither does deleting it by hand
+afterwards. GitHub is configured not to delete branches on merge either, so a
+branch that goes missing went missing because somebody asked for that — and the
+branch name is what the work is still called long after the pull request has
+scrolled out of view.
+
 Anything that needs saying at length — a conflict with other work, an
 assumption you had to make, something only another checkout can do — goes to
 whoever dispatched you, not into the repository.
