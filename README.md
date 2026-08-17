@@ -73,6 +73,11 @@ herdr-bellwethr agent-commands install --kind gemini --stdout   print them inste
 herdr-bellwethr agent-commands remove                   take back what it wrote
 ```
 
+Installing is also in the `prefix+a` launcher, as **Agent: install commands** —
+it asks which kind and reports through a notification, since a launcher action
+has no terminal to print to. `status` and `remove` stay on the command line,
+where their output has somewhere to go.
+
 The briefing for each verb is written once, in `config/agent/`, and knows
 nothing about any particular agent. Installing renders it into the shape the
 agent reads — markdown with a YAML header, plain markdown, a TOML file, or a
