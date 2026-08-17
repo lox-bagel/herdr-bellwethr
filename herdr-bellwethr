@@ -1014,8 +1014,6 @@ def cmd_conventions(args):
 # A herdr agent alias has to match this and be unique among *live* agents.
 AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
-DEFAULT_TASK_FILE = "TASK.md"
-
 # The two instructions dispatch is entitled to give an agent, because both are
 # about the handover it arranged rather than about what the work is. Every task
 # needs them and no task remembers to say them.
@@ -1104,6 +1102,42 @@ def start_agent(alias, kind, pane_id, timeout_ms):
             return result, err
         if time.monotonic() >= deadline:
             return {}, err + " — the pane never reached a shell prompt"
+        time.sleep(0.5)
+
+
+def agent_state_seq(alias):
+    """The agent's state_change_seq, or None if herdr would not say."""
+    info, _ = herdr_quiet("agent", "get", alias)
+    return (info.get("agent") or {}).get("state_change_seq")
+
+
+def submit_task(alias, document, timeout_ms):
+    """Submit the task, waiting out an agent that is up but not reading input.
+
+    `agent start` returns once the agent reports itself interactive, which for
+    claude is a moment before its first screen keeps what is pasted into it: the
+    text goes nowhere and `agent prompt` answers agent_prompt_stalled. The task
+    is nowhere but in this process, so it is worth another go rather than a
+    report that it was lost.
+
+    Resending is only safe while nothing has landed, so state_change_seq is read
+    either side of a stall: an agent that moved anyway took the task, and a
+    second copy would arrive as a second prompt.
+    """
+    deadline = time.monotonic() + max(timeout_ms, 1000) / 1000.0
+    while True:
+        before = agent_state_seq(alias)
+        result, err = herdr_quiet(
+            "agent", "prompt", alias, document, "--wait",
+            "--until", "working", "--timeout", str(timeout_ms))
+        if result or "agent_prompt_stalled" not in err:
+            return result, err
+
+        after = agent_state_seq(alias)
+        if before is not None and after is not None and after != before:
+            return {"state_change_seq": after}, ""
+        if time.monotonic() >= deadline:
+            return {}, err + " — the agent never took the task"
         time.sleep(0.5)
 
 
@@ -1206,6 +1240,10 @@ def fail(args, stage, message, detail=""):
 def task_document(args, repo, checkout, branch, workspace_id, pane_id):
     """The task as written, dispatch's own two rules, and where that runs.
 
+    Submitted to the agent as its first prompt. Nothing is written into the
+    checkout: a task file would sit there untracked for the life of the branch,
+    where every review and every `git status` reads it as a pending change.
+
     An agent dropped into a fresh worktree cannot tell it is in one, and reasons
     about it as the repository — which is how a task written in the primary
     checkout ends up asking for something only that checkout can do.
@@ -1292,15 +1330,6 @@ def cmd_dispatch(args):
             fail(args, "probe",
                  "the repo's pre-commit hook refused branch %s" % branch, output)
 
-    task_path = os.path.join(checkout, args.task_file)
-    try:
-        with open(task_path, "w") as handle:
-            handle.write(task_document(args, repo, checkout, branch,
-                                       workspace_id, pane_id))
-    except OSError as exc:
-        teardown(workspace_id, repo, branch, checkout)
-        fail(args, "task", "could not write %s: %s" % (task_path, exc))
-
     alias = args.agent_name or agent_alias(branch, live_agent_names())
     if not AGENT_NAME_RE.match(alias):
         teardown(workspace_id, repo, branch, checkout)
@@ -1312,14 +1341,17 @@ def cmd_dispatch(args):
         fail(args, "agent", "%s did not come up in the new pane" % args.kind,
              err or "herdr agent start said nothing. Try `herdr agent explain`.")
 
-    prompt = args.prompt or (
-        "Read %s in the repository root and start on it." % args.task_file)
+    document = task_document(args, repo, checkout, branch, workspace_id, pane_id)
 
+    # `agent prompt` submits text and Enter atomically, honouring the pane's
+    # bracketed-paste mode, so the document arrives as one prompt however many
+    # lines and blank lines it has.
+    #
     # No teardown past this point: the agent is up, and throwing the worktree
-    # away would take its session with it. A failed prompt is retried by hand.
-    submitted, prompt_err = herdr_quiet(
-        "agent", "prompt", alias, prompt, "--wait",
-        "--until", "working", "--timeout", str(args.prompt_timeout))
+    # away would take its session with it. A task that never lands is retried by
+    # hand, and the document is reported back so there is something to retry
+    # with.
+    submitted, prompt_err = submit_task(alias, document, args.prompt_timeout)
 
     result = {
         "ok": True,
@@ -1330,10 +1362,14 @@ def cmd_dispatch(args):
         "pane": pane_id,
         "agent": alias,
         "kind": args.kind,
-        "task_file": task_path,
         "prompted": bool(submitted),
         "prompt_error": prompt_err,
     }
+
+    # Only where it is needed: the document is nowhere on disk, so a prompt
+    # that did not land has to come back with it or it is gone.
+    if not submitted:
+        result["task"] = document
 
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -1345,10 +1381,13 @@ def cmd_dispatch(args):
         # alias, after which `agent prompt <name>` answers agent_not_found.
         print("  reach it   herdr agent prompt %s ...   (or %s, which survives "
               "a herdr restart)" % (alias, pane_id))
-        print("  task       %s" % task_path)
         if not submitted:
-            print("  ! the prompt did not land: %s" % (prompt_err or "no reason given"))
-            print("    submit it with `herdr agent prompt %s ...`" % alias)
+            print("  ! the task did not land: %s" % (prompt_err or "no reason given"))
+            print("    the document is below; nothing wrote it to disk, so "
+                  "keep it if you mean to retry")
+            print("    retry with `herdr agent prompt %s <document>`" % alias)
+            print("")
+            print(document)
 
     notify("Herdr Bellwethr: dispatched", "%s → %s" % (branch, alias))
 
@@ -1379,18 +1418,12 @@ def worktree_entries(repo):
     return out
 
 
-def is_dirty(path, task_file):
-    """Uncommitted work, ignoring the task file dispatch wrote.
-
-    Nothing ever commits that file, so without this every dispatched worktree
-    looks mid-edit forever.
-    """
+def is_dirty(path):
+    """Uncommitted work of any kind, tracked or not."""
     code, out, _ = git(path, "status", "--porcelain")
     if code != 0:
         return None
     for line in out.splitlines():
-        if line[3:].strip() == task_file and line.startswith("??"):
-            continue
         if line.strip():
             return True
     return False
@@ -1462,7 +1495,7 @@ def pull_request_state(repo, branch):
     return None
 
 
-def reap_reason(repo, path, branch, base, workspaces, task_file):
+def reap_reason(repo, path, branch, base, workspaces):
     """Why this worktree is or is not finished with, as (removable, reason)."""
     if not branch:
         return False, "detached HEAD — nothing to judge it by"
@@ -1472,7 +1505,7 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
     if not os.path.isdir(path):
         return True, "checkout is gone"
 
-    dirty = is_dirty(path, task_file)
+    dirty = is_dirty(path)
     if dirty is None:
         return False, "could not read its status"
     if dirty:
@@ -1552,7 +1585,7 @@ def cmd_reap(args):
         if here == path or here.startswith(path + os.sep):
             kept.append((path, branch, "you are in it"))
             continue
-        ok, reason = reap_reason(repo, path, branch, args.base, workspaces, args.task_file)
+        ok, reason = reap_reason(repo, path, branch, args.base, workspaces)
         (removable if ok else kept).append((path, branch, reason))
 
     if args.json:
@@ -1575,7 +1608,6 @@ def cmd_reap(args):
     if not args.remove:
         return
 
-    task_file = args.task_file
     for path, _, _ in removable:
         workspace_id = workspace_of.get(path)
         if workspace_id:
@@ -1584,10 +1616,10 @@ def cmd_reap(args):
         if os.path.isdir(path):
             code, _, err = git(repo, "worktree", "remove", path)
             if code != 0:
-                # git refuses a worktree holding anything untracked, and every
-                # dispatched one holds the task file. Re-check rather than trust
+                # git refuses a worktree holding anything untracked, which a
+                # build leaves behind readily enough. Re-check rather than trust
                 # reap_reason, whose decision predates everything above.
-                if is_dirty(path, task_file) is False:
+                if is_dirty(path) is False:
                     code, _, err = git(repo, "worktree", "remove", "--force", path)
                 if code != 0:
                     warn("kept %s: %s" % (path, err.splitlines()[0] if err else "refused"))
@@ -1666,7 +1698,7 @@ def main():
     dispatch = subparsers.add_parser(
         "dispatch", help="hand a task to an agent in a fresh worktree",
         description="Create a worktree, start an agent in it, and give it the task.",
-        epilog="The task is written into the worktree exactly as given, so give it in "
+        epilog="The task is submitted to the agent exactly as given, so give it in "
                "the requester's own words and not as a briefing about them: findings, "
                "line numbers, conventions and conclusions gathered by whoever calls "
                "this are guesses by the time the agent reads them, and the agent's "
@@ -1677,8 +1709,8 @@ def main():
                "everything created is torn down again. The agent's name is forgotten "
                "if herdr restarts, so hold on to the pane id it reports — that keeps "
                "working.")
-    dispatch.add_argument("task", help="the task in the requester's own words, written "
-                                       "into the worktree for the agent unchanged")
+    dispatch.add_argument("task", help="the task in the requester's own words, given "
+                                       "to the agent unchanged as its first prompt")
     dispatch.add_argument("--branch", required=True, metavar="NAME",
                           help="branch to create (required; nothing here invents one)")
     dispatch.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
@@ -1689,15 +1721,11 @@ def main():
     dispatch.add_argument("--agent-name", metavar="NAME",
                           help="agent alias (default: derived from the branch)")
     dispatch.add_argument("--label", metavar="TEXT", help="workspace label (default: the branch)")
-    dispatch.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
-                          help="where to write the task (default: %s)" % DEFAULT_TASK_FILE)
-    dispatch.add_argument("--prompt", metavar="TEXT",
-                          help="what to say to the agent (default: read the task file)")
     dispatch.add_argument("--no-context", action="store_true",
                           help="leave out the note saying which worktree and "
                                "branch it is running in (the rules about asking "
                                "and about how the work is reported are always "
-                               "written)")
+                               "sent)")
     dispatch.add_argument("--no-probe", action="store_true",
                           help="skip asking the repo's pre-commit about the branch name")
     dispatch.add_argument("--focus", action="store_true", help="focus the new workspace")
@@ -1721,9 +1749,6 @@ def main():
     reap.add_argument("--base", metavar="REF", default="main",
                       help="branch work merges into (default: main)")
     reap.add_argument("--remove", action="store_true", help="actually remove them")
-    reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
-                      help="task file dispatch writes, ignored when judging a "
-                           "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)
     reap.add_argument("--no-fetch", action="store_true",
                       help="skip `git fetch --prune`, use cached remote refs")
     reap.add_argument("--json", action="store_true", help="machine-readable")
