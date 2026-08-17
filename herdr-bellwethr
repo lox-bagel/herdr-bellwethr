@@ -1401,7 +1401,7 @@ def worktree_entries(repo):
 # a `git branch -d` refusal is git being literal rather than git being right.
 LANDED_ELSEWHERE = (
     "its upstream branch is gone",
-    "its commits are on a remote branch",
+    "its commits are on another remote branch",
 )
 
 
@@ -1420,6 +1420,35 @@ def is_dirty(path, task_file):
             continue
         if line.strip():
             return True
+    return False
+
+
+def landed_on_another_remote_branch(repo, branch):
+    """Whether this branch's commits turned up on some *other* remote branch.
+
+    Pushing is not landing. `--contains` finds the branch's own upstream first
+    of all, so an unqualified reading of it calls a branch finished the moment
+    it is pushed — which is the moment the work starts being reviewed, with an
+    agent still sitting in the worktree waiting to answer. Its own remote ref is
+    the one piece of evidence that proves nothing, so it is excluded: by the
+    configured upstream where there is one, and by name for a branch pushed
+    without tracking.
+    """
+    code, remotes, _ = git(repo, "branch", "--remotes", "--contains", branch)
+    if code != 0 or not remotes:
+        return False
+
+    _, upstream, _ = git(repo, "rev-parse", "--abbrev-ref",
+                         "%s@{upstream}" % branch)
+    upstream = upstream.strip()
+
+    for line in remotes.splitlines():
+        ref = line.strip().lstrip("* ").strip()
+        if not ref or ref.startswith("origin/HEAD"):
+            continue
+        if ref == upstream or ref.endswith("/" + branch):
+            continue
+        return True
     return False
 
 
@@ -1458,23 +1487,26 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
         return False, "has commits that are not pushed"
 
     state = workspaces.get(os.path.realpath(path))
-    if state == "working":
-        return False, "an agent is still working in it"
+    if state in ("working", "blocked"):
+        # blocked is an agent waiting on somebody, which is a conversation in
+        # progress rather than a finished one. idle is not: an agent that has
+        # finished its turn in a worktree whose work has landed is exactly what
+        # this is here to clear up.
+        return False, "an agent is %s in it" % state
 
     code, _, _ = git(repo, "merge-base", "--is-ancestor", branch, base)
     if code == 0:
         return True, "merged into %s" % base
 
-    code, remotes, _ = git(repo, "branch", "--remotes", "--contains", branch)
-    if code == 0 and remotes:
-        return True, "its commits are on a remote branch"
+    if landed_on_another_remote_branch(repo, branch):
+        return True, "its commits are on another remote branch"
 
     if upstream_gone:
         code, tracked, _ = git(repo, "config", "--get", "branch.%s.remote" % branch)
         if code == 0 and tracked:
             return True, "its upstream branch is gone"
 
-    return False, "not merged into %s and not on a remote" % base
+    return False, "not merged into %s and not on another remote branch" % base
 
 
 def cmd_reap(args):
