@@ -1,12 +1,9 @@
 onboarding = false
-# Custom command keybinds.
-#
-# Every binding carries a `description` — that is what the prefix+? help menu
-# shows. Without one, herdr lists the entry under custom commands with no name.
-# Add a description to any binding you add.
 
-# The quick-action launcher (Herdr Plus). Everything in
-# ~/.config/herdr/plugins/config/cloudmanic.herdr-plus/quick-actions/ is
+# Every binding needs a `description`: it is what the prefix+? help menu shows,
+# and without one herdr lists the entry with no name.
+
+# The quick-action launcher. Everything in herdr-plus's quick-actions/ dir is
 # reachable from here, so a new action needs no new keybind.
 [[keys.command]]
 key = "prefix+a"
@@ -14,57 +11,36 @@ type = "plugin_action"
 command = "cloudmanic.herdr-plus.quick-actions"
 description = "Quick actions"
 
-# herdr-lazy's manage pane. Originally added by herdr-lazy's own bootstrap.
 [[keys.command]]
 key = "prefix+shift+l"
 type = "plugin_action"
 command = "herdr-lazy.manage"
 description = "herdr-lazy: manage plugins"
 
-# Herdr Plus project browser: build a whole workspace from a template.
 [[keys.command]]
 key = "prefix+shift+o"
 type = "plugin_action"
 command = "cloudmanic.herdr-plus.projects"
 description = "Herdr Plus: projects"
 
-# The reverse of prefix+shift+o: turn the focused space into a project template.
-# `shell` keeps it out of the layout — a `pane` binding would add a pane to the
-# very space being saved. It runs detached, so --notify is what reports back,
-# and --force means pressing this again re-snapshots the space instead of
-# failing on the file it wrote last time. This is the plain "save": the project
-# is named after the space. To save under a new name, use "Plus: save as
-# project" in the quick-action launcher (prefix+a).
+# `shell`, not `pane`: a pane binding would add a pane to the very space being
+# saved. Detached, so --notify is the only way the result reaches anyone.
 [[keys.command]]
 key = "prefix+shift+s"
 type = "shell"
 command = "herdr-bellwethr save --notify --force"
 description = "Herdr Plus: save project"
 
-# reviewr's diff pane, over the repo the focused pane is sitting in. Toggle
-# rather than open: the pane is a split, and the second press is how you get the
-# room back. reviewr also opens itself for a freshly created worktree, so this
-# is for the reviews that do not start with one.
-#
-# shift+v because v alone splits a pane vertically, and reviewr's own suggestion
-# of cmd+r is a chord many terminals eat before herdr sees it.
+# shift+v because plain v splits a pane vertically, and reviewr's own suggested
+# cmd+r is a chord many terminals eat before herdr sees it.
 [[keys.command]]
 key = "prefix+shift+v"
 type = "plugin_action"
 command = "persiyanov.reviewr.toggle"
 description = "reviewr: toggle diff pane"
 
-# drovr's two movers: take what is focused somewhere else without restarting it.
-# A tab goes to another workspace, a pane goes to another tab; both keep their
-# processes — the live agents included — which is the whole point of moving
-# rather than closing and reopening.
-#
-# m for move, and it was free: herdr binds no plain m and no shift+m (its own
-# keys are the ones listed in config/quick-actions/), and nothing above claims
-# either. The split follows herdr's own convention that a plain key acts on the
-# pane and the shift key acts on the tab — prefix+x closes a pane, prefix+shift+x
-# closes a tab — so prefix+m moves the pane and prefix+shift+m moves the tab.
-# It is also what drovr's own README suggests, so muscle memory carries over.
+# Plain key acts on the pane, shift on the tab, following herdr's own pairing
+# (prefix+x closes a pane, prefix+shift+x a tab). m was free in both.
 #
 # NOTE: drovr needs node >= 23 to run at all; this machine has v18. These binds
 # are correct and inert until that is fixed. See config/plugins.list.

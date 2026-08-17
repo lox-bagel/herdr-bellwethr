@@ -1,25 +1,12 @@
 # reviewr's own config, linked into persiyanov.reviewr's config dir by dev-link.
-#
-# Not herdr's: settings in ~/.config/herdr/config.toml never reach it. reviewr
-# re-reads this on every refresh and toggle, so an edit applies without a
-# relaunch — and because it is linked, an edit here is an edit there.
-#
-# It ships with bellwethr because bellwethr already recommends reviewr in
-# plugins.list and binds prefix+shift+v to it. A recommendation that leaves the
-# plugin opening on an empty pane is half a recommendation.
+# Not herdr's: settings in ~/.config/herdr/config.toml never reach it.
 
-# Open on the whole branch rather than on uncommitted work. reviewr starts in
-# `uncommitted` (working tree vs HEAD), which is empty whenever the work is
-# already committed — the usual state when reviewing an agent's finished branch
-# before a merge. `branch` is the working tree vs the merge-base with the base
-# branch: the branch's commits plus anything uncommitted, which is the same
-# diff the pull request shows.
+# reviewr's own default, `uncommitted`, is empty whenever the work is already
+# committed — the usual state when reviewing an agent's finished branch.
+# `branch` is the same diff the pull request shows.
 #
-# The base itself is not set here. reviewr takes it from `origin/HEAD`, so a
-# clone missing that ref (one created locally and pushed, rather than cloned)
-# resolves nothing and the header reads `no base`. Fix it in git, once:
-#
-#     git remote set-head origin -a
-#
-# `B` in the pane overrides it per repo; `--base <ref>` pins it per pane.
+# The base branch is not set here: reviewr reads it from `origin/HEAD`. A repo
+# created locally and pushed has no such ref, and the header reads `no base`
+# until you run `git remote set-head origin -a` once. `B` overrides it per repo,
+# `--base <ref>` per pane.
 default_scope = "branch"

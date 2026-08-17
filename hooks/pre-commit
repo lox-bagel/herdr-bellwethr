@@ -2,35 +2,8 @@
 #
 # pre-commit — refuse to commit on main, or on a branch named off-convention.
 #
-# main is what the PR flow merges into, so a commit landing there directly is
-# either a mistake or a decision worth making on purpose. Branch first:
-#
-#   git switch -c feat/some-thing
-#
-# A commit already made on main is not lost and not hard to move:
-#
-#   git branch feat/some-thing && git reset --hard origin/main
-#
-# The branch name is checked here rather than at push time because a name is
-# cheap to change before there are commits on it and awkward after — `git branch
-# -m` is fine locally, but once the branch is pushed and has a pull request the
-# rename has to happen on the remote to keep the PR attached to it.
-#
-# Deliberate exceptions, in the order you should reach for them:
-#
-#   BELLWETHR_SKIP_CHECKS=1 git commit ...   say it once, for this commit
-#   git commit --no-verify ...               skip every hook, this one included
-#
-# This is a local guard, not protection. It lives on this machine only, it is
-# off in a clone that has not set core.hooksPath, and --no-verify walks past it.
-# Real enforcement is a branch ruleset on the remote, which the repo being
-# private on a personal account currently rules out.
-#
-# DELETE THIS HOOK WHEN THE REPO GOES PUBLIC and a ruleset replaces it. The
-# recipe, and why the hooks stop being the right answer at that point, are in
-# the header of hooks/pre-push next to this file. Note that a ruleset replaces
-# the main check only — branch naming and commit format have no ruleset
-# equivalent, so those parts of these hooks stay.
+# The name is checked at commit time, not push time: once a branch is pushed and
+# has a pull request, renaming it has to happen on the remote or the PR closes.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -38,8 +11,8 @@ fi
 
 . "$(dirname "$0")/common.sh"
 
-# A detached HEAD is not main and not the PR flow — rebases and bisects run
-# here, and refusing them would break more than it protects.
+# Detached HEAD is where rebases and bisects run; refusing them would break more
+# than it protects.
 branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
 
 if [ "$branch" = "main" ]; then

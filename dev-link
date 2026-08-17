@@ -7,45 +7,13 @@
 #   dev-link apply --adopt   first copy any live-only content back into the repo
 #   dev-link remove     turn every link back into a plain file (repo content)
 #
-# Run it from the primary checkout. A `git worktree` has its own copy of
-# config/, and only one checkout can own the symlinks in a given herdr install,
-# so from a worktree the target has to be named rather than inferred:
+# For development, not installation: the installer will copy files and record a
+# receipt, because a user's config should not depend on a checkout staying put.
 #
-#   mkdir -p /tmp/herdr-test
-#   ./dev-link apply --herdr-config /tmp/herdr-test/herdr
-#   XDG_CONFIG_HOME=/tmp/herdr-test herdr --session test
-#
-# That second herdr has its own config.toml, plugin registry and socket, so a
-# change under test cannot break the session you are working in. Testing there
-# rather than in your own herdr is worth doing from the primary checkout too.
-#
-# This exists so an edit lands in one place during development. It is not the
-# installer: the installer will *copy* files and record a receipt, because a
-# user's config should not depend on a checkout staying where it was. Symlinks
-# are the development shape of the same file list.
-#
-# Borrowed wholesale from herdr-lazy's prune: anything we are not certain about
-# is reported, not overwritten. A refused link is an annoyance you can resolve
-# by hand; clobbering a file you had edited is not recoverable. So `apply`
-# refuses any target whose live content differs from the repo's, and says what
-# differs, until you pass --adopt (take the live version) or --force (discard
-# it). Either way the previous content is copied to a backup directory first.
-#
-# What is deliberately NOT linked, and why:
-#
-#   plugins.lock   herdr-lazy owns it and rewrites it on every sync. It is a
-#                  resolution record, not configuration — the repo copy is a
-#                  snapshot, and linking would let a sync rewrite the repo.
-#   projects/*     user data. `herdr-bellwethr save` writes it, the user names it,
-#                  and nothing here should install, link, or remove it. The
-#                  repo's copy is a worked example, not something to install.
-#
-# One hazard worth knowing about: a symlink survives an in-place write but not
-# an atomic write-and-rename, which replaces the link with a plain file and
-# strands the repo copy silently. herdr writes config.toml itself (that is where
-# `onboarding = false` came from) and so does herdr-lazy when it binds a key.
-# `status` is how you notice: a target that should be a link and reads as a
-# plain file has drifted, and the diff tells you which side moved.
+# A symlink survives an in-place write but not an atomic write-and-rename, which
+# replaces the link with a plain file and strands the repo copy silently. herdr
+# rewrites config.toml itself, and so does herdr-lazy when it binds a key, so
+# this is worth running `status` for.
 
 """Symlink this repo's config into a live herdr install, reversibly."""
 
@@ -82,10 +50,8 @@ def die(msg):
 def herdr_config_dir(override=None):
     """Which herdr install we are pointing at.
 
-    An explicit --herdr-config wins, because saying it is the whole point: from
-    anywhere but the primary checkout it is required, so the target is never
-    something this tool inferred. Otherwise the session we are running inside,
-    which HERDR_SOCKET_PATH names, and failing that the default location.
+    --herdr-config, else the session we are running inside (HERDR_SOCKET_PATH
+    names its directory), else the default location.
     """
     if override:
         return os.path.abspath(os.path.expanduser(override))
@@ -97,16 +63,11 @@ def herdr_config_dir(override=None):
 
 
 def plugin_config_dir(plugin_id, config_dir):
-    """Ask herdr, the same way herdr-bellwethr does — never guess this path.
+    """Ask herdr, so the path matches the one the plugin itself will read.
 
-    herdr provisions the directory and keeps it across plugin upgrades, so it is
-    the one the plugin itself will read.
-
-    Only for the install we are actually running inside, though. `herdr plugin
-    config-dir` answers for the session on the other end of the socket, so
-    asking it about some other config dir returns the wrong path with no sign
-    that it did. For an explicit target the layout is the answer, and herdr
-    creates the directory on first use either way.
+    Only for the install we are running inside: `herdr plugin config-dir`
+    answers for the session on the other end of the socket, so asking it about
+    some other config dir returns the wrong path with no sign that it did.
     """
     if config_dir != herdr_config_dir():
         return os.path.join(config_dir, "plugins", "config", plugin_id)
@@ -130,8 +91,8 @@ def plugin_config_dir(plugin_id, config_dir):
 def is_primary_checkout():
     """False in a `git worktree` checkout, true in the clone it was made from.
 
-    A linked worktree keeps its own .git *file* pointing into the primary's
-    .git directory, so the two paths differ there and match here.
+    A linked worktree's --git-dir points into the primary's --git-common-dir,
+    so the two differ there and match here.
     """
     try:
         proc = subprocess.run(
@@ -152,26 +113,9 @@ def is_primary_checkout():
 def require_explicit_target(override):
     """Refuse to guess which install a worktree is allowed to write to.
 
-    Worktrees are the reason this exists. git will not check the same branch out
-    twice, but `--detach` will happily give you a second tree at the same commit
-    that then drifts, and every worktree has its own copy of config/ — so
-    "the files this repo installs" stops being one answer the moment there is
-    more than one checkout. Whichever tree ran `apply` last owns the symlinks,
-    the others silently do not, and `herdr worktree remove` on the winner leaves
+    Every worktree has its own config/, so whichever tree ran `apply` last owns
+    the symlinks and the others silently do not — and removing the winner leaves
     the install pointing at a directory that is gone.
-
-    Rather than rank the checkouts, this refuses to infer anything: outside the
-    primary one, name the install. The reasonable target is a throwaway herdr
-    that a broken config cannot cost you anything in, which is a directory and
-    an environment variable:
-
-        mkdir -p /tmp/herdr-test
-        ./dev-link apply --herdr-config /tmp/herdr-test/herdr
-        XDG_CONFIG_HOME=/tmp/herdr-test herdr --session test
-
-    That herdr has its own config.toml, its own plugin registry and its own
-    socket, so testing a change to either cannot disturb the session you are
-    reading this in.
     """
     if override or is_primary_checkout():
         return
@@ -194,11 +138,9 @@ def require_explicit_target(override):
 def targets(config_dir):
     """Every (repo file, live path) pair this tool manages, in apply order.
 
-    Quick actions are listed one file at a time rather than linking the
-    directory: the live directory is shared with whatever actions the user
-    writes, and a directory symlink would hide them all behind the repo's set.
-    Per-file links leave the user's own files alone, which is also the shape the
-    installer's receipt will need.
+    Quick actions are listed one file at a time: the live directory is shared
+    with whatever the user writes there, and a directory symlink would hide all
+    of it behind the repo's set.
     """
     pairs = []
 
@@ -218,8 +160,6 @@ def targets(config_dir):
         os.path.join(plugin_config_dir(LAZY_ID, config_dir), "plugins.list"),
     ))
 
-    # reviewr's own config. A plugin we recommend and bind a key to, so the
-    # settings that make that key land on something useful travel with it.
     pairs.append((
         os.path.join(REPO, "config", "reviewr.toml"),
         os.path.join(plugin_config_dir(REVIEWR_ID, config_dir), "config.toml"),
@@ -234,7 +174,7 @@ def digest(path):
 
 
 def state(repo_path, live_path):
-    """Classify one target. The whole tool turns on getting this right."""
+    """Classify one target."""
     if not os.path.exists(repo_path):
         return "repo-missing"
     if os.path.islink(live_path):
@@ -274,11 +214,7 @@ def backup_root(config_dir):
 
 
 def back_up(live_path, root):
-    """Copy a live file aside before we touch it, preserving its full path.
-
-    Backups live under herdr's config dir, not in the repo: they are this
-    machine's previous state, and committing them would be noise at best.
-    """
+    """Copy a live file aside before we touch it, preserving its full path."""
     dest = os.path.join(root, live_path.lstrip(os.sep))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copy2(live_path, dest)
@@ -290,9 +226,7 @@ def back_up(live_path, root):
 def cmd_status(args):
     config_dir = herdr_config_dir(args.herdr_config)
 
-    # Which checkout and which install, before the list — the same file list
-    # says something different depending on both, and status is the command you
-    # run when you are not sure.
+    # The same file list means something different per checkout and install.
     print("checkout: %s%s" % (
         relative(REPO), "" if is_primary_checkout() else "  (linked worktree)"))
     print("install:  %s" % relative(config_dir))
@@ -334,8 +268,8 @@ def cmd_apply(args):
     config_dir = herdr_config_dir(args.herdr_config)
     pairs = targets(config_dir)
 
-    # Refuse the whole run rather than half of it. A partial apply leaves the
-    # machine in a state neither `status` nor the user can reason about.
+    # Refuse the whole run rather than half of it: a partial apply leaves a
+    # state neither `status` nor the user can reason about.
     blocked = []
     for repo_path, live_path in pairs:
         kind = state(repo_path, live_path)
@@ -389,9 +323,7 @@ def cmd_apply(args):
 def cmd_remove(args):
     """Undo `apply`: every link becomes a plain file holding the repo's content.
 
-    Not a delete. Removing the link should leave the machine configured exactly
-    as it is now — the point is to stop the live config depending on this
-    checkout, not to strip the config out.
+    Not a delete — the machine stays configured exactly as it is now.
     """
     require_explicit_target(args.herdr_config)
     config_dir = herdr_config_dir(args.herdr_config)
@@ -433,8 +365,7 @@ def main():
     remove = subparsers.add_parser("remove", help="turn links back into plain files")
     remove.set_defaults(func=cmd_remove)
 
-    # On every subcommand rather than on the parser, so it can follow the verb:
-    # `apply --herdr-config X` is the order people type it in.
+    # On each subcommand, not the parser, so it can follow the verb.
     for sub in (status, apply_cmd, remove):
         sub.add_argument("--herdr-config", metavar="DIR",
                          help="herdr config dir to target; required outside the "

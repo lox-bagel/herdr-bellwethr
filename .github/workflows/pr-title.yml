@@ -1,17 +1,8 @@
-# Hold pull request titles to the same Conventional Commits format as commit
-# subjects. A squash merge takes its default subject from the PR title, so this
-# is the check that stops an off-convention message reaching main by the one
-# route the commit-msg hook never sees.
+# A squash merge takes its default subject from the PR title, so this is the
+# one route to main that the commit-msg hook never sees.
 #
-# It reports; it does not block. A failing check only prevents a merge when a
-# ruleset marks it required, and rulesets are refused on a private repository
-# under a personal account. The recipe in hooks/pre-push already lists this
-# check under required_status_checks, so making the repo public turns the report
-# into enforcement with nothing further to write here.
-#
-# No third-party action on purpose: the whole check is one regex, and a
-# marketplace action would mean trusting somebody else's code with a token for
-# it.
+# No third-party action on purpose: a marketplace action for one regex would
+# mean trusting somebody else's code with a token.
 
 name: pr-title
 
@@ -29,15 +20,12 @@ jobs:
       - name: Check the title is Conventional Commits
         env:
           # Through the environment, never interpolated into the script body:
-          # a title is attacker-controlled text on a public repo, and
-          # ${{ github.event.pull_request.title }} inline would run whatever
-          # shell somebody put in it.
+          # a title is attacker-controlled text, and ${{ ... }} inline would run
+          # whatever shell somebody put in it.
           TITLE: ${{ github.event.pull_request.title }}
         run: |
-          # Keep in step with BELLWETHR_TYPES and the subject rules in
-          # hooks/common.sh and hooks/commit-msg — a workflow cannot source a
-          # shell file that is not on the runner's path yet. Change one, change
-          # the other.
+          # Keep in step with BELLWETHR_TYPES in hooks/common.sh and the subject
+          # rules in hooks/commit-msg. Change one, change the other.
           types='feat|fix|docs|refactor|chore|test|build|ci'
 
           if ! printf '%s' "$TITLE" | grep -Eq "^(${types})(\([a-z0-9][a-z0-9-]*\))?!?: .+"; then
