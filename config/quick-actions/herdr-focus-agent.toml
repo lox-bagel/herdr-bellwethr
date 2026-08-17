@@ -1,0 +1,7 @@
+name = "Herdr: focus agent     "
+description = "(unset):          Focus an agent by index 1-9."
+type = "form"
+command = "herdr agent focus '{{.Value}}'"
+
+[form]
+prompt = "Agent target (pane id or name)"

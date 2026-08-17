@@ -1,0 +1,4 @@
+name = "Herdr: reload config   "
+description = "(prefix+shift+r): Reload config.toml in the running app/server."
+type = "command"
+command = "herdr server reload-config"

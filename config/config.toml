@@ -1,0 +1,51 @@
+# Custom command keybinds.
+#
+# Every binding carries a `description` — that is what the prefix+? help menu
+# shows. Without one, herdr lists the entry under custom commands with no name.
+# Add a description to any binding you add.
+
+# The quick-action launcher (Herdr Plus). Everything in
+# ~/.config/herdr/plugins/config/cloudmanic.herdr-plus/quick-actions/ is
+# reachable from here, so a new action needs no new keybind.
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "cloudmanic.herdr-plus.quick-actions"
+description = "Quick actions"
+
+# herdr-lazy's manage pane. Originally added by herdr-lazy's own bootstrap.
+[[keys.command]]
+key = "prefix+shift+l"
+type = "plugin_action"
+command = "herdr-lazy.manage"
+description = "herdr-lazy: manage plugins"
+
+# Herdr Plus project browser: build a whole workspace from a template.
+[[keys.command]]
+key = "prefix+shift+o"
+type = "plugin_action"
+command = "cloudmanic.herdr-plus.projects"
+description = "Herdr Plus: projects"
+
+# The reverse of prefix+shift+o: turn the focused space into a project template.
+# `shell` keeps it out of the layout — a `pane` binding would add a pane to the
+# very space being saved. It runs detached, so --notify is what reports back,
+# and --force means pressing this again re-snapshots the space instead of
+# failing on the file it wrote last time. This is the plain "save": the project
+# is named after the space. To save under a new name, use "Plus: save as
+# project" in the quick-action launcher (prefix+a).
+[[keys.command]]
+key = "prefix+shift+s"
+type = "shell"
+command = "herdr-project save --notify --force"
+description = "Herdr Plus: save project"
+
+[theme]
+name = "terminal"
+auto_switch = false
+
+[ui]
+agent_panel_sort = "spaces"
+
+[ui.toast]
+delivery = "herdr"

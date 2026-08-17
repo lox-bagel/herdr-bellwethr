@@ -1,0 +1,7 @@
+name = "Herdr: open worktree   "
+description = "(unset):          Open an existing Git worktree from the selected workspace."
+type = "form"
+command = "herdr worktree open --cwd '{{.WorkDir}}' --branch '{{.Value}}'"
+
+[form]
+prompt = "Existing worktree branch"

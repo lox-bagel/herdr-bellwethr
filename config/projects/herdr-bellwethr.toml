@@ -1,0 +1,25 @@
+# An example herdr-plus project, of the kind `herdr-project save` writes.
+#
+# Projects are per-machine snapshots — this one is here as a worked example, not
+# as something to install verbatim. Drop it in
+# ~/.config/herdr/plugins/config/cloudmanic.herdr-plus/projects/ and it shows up
+# in the projects browser (prefix+shift+o).
+
+name = "herdr-bellwethr"
+working_dir = "~/ws/herdr-bellwethr"
+
+[[tabs]]
+name = "claude"
+command = "claude"
+
+[[tabs]]
+name = "edit"
+
+[[tabs.panes]]
+label = "quick-actions"
+command = "cd ~/.config/herdr/plugins/config/cloudmanic.herdr-plus/quick-actions"
+
+[[tabs.panes]]
+label = "config"
+command = "cd ~/.config/herdr"
+split = "right"

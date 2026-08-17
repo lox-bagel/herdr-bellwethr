@@ -1,0 +1,4 @@
+name = "Herdr: focus pane down "
+description = "(prefix+j):       Focus the pane below."
+type = "command"
+command = "herdr pane focus --pane '{{.PaneId}}' --direction down"

@@ -1,0 +1,4 @@
+name = "Herdr: new tab         "
+description = "(prefix+c):       Create a new tab in the active workspace."
+type = "command"
+command = "herdr tab create --workspace '{{.WorkspaceId}}' --cwd '{{.WorkDir}}'"

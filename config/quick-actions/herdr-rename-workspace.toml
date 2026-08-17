@@ -1,0 +1,7 @@
+name = "Herdr: rename workspace"
+description = "(prefix+shift+w): Rename the selected workspace."
+type = "form"
+command = "herdr workspace rename '{{.WorkspaceId}}' '{{.Value}}'"
+
+[form]
+prompt = "New workspace label"

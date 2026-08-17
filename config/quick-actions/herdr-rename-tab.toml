@@ -1,0 +1,7 @@
+name = "Herdr: rename tab      "
+description = "(prefix+shift+t): Rename the active tab."
+type = "form"
+command = "herdr tab rename '{{.TabId}}' '{{.Value}}'"
+
+[form]
+prompt = "New tab label"

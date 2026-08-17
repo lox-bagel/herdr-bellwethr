@@ -1,0 +1,4 @@
+name = "Lazy: manage plugins   "
+description = "(prefix+shift+l): Open the herdr-lazy manage pane."
+type = "command"
+command = "herdr plugin action invoke herdr-lazy.manage"

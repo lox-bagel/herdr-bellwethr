@@ -1,0 +1,4 @@
+name = "Plus: delete project   "
+description = "(unset):          Fuzzy-pick a saved project and delete it."
+type = "command"
+command = "herdr plugin action invoke herdr-project.delete"

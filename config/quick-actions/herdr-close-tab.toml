@@ -1,0 +1,14 @@
+name = "Herdr: close tab       "
+description = "(prefix+shift+x): Close the active tab."
+type = "select"
+command = "case '{{.Value}}' in yes) herdr tab close '{{.TabId}}' ;; *) : ;; esac"
+
+[[options]]
+label = "Cancel"
+value = "no"
+description = "Do nothing"
+
+[[options]]
+label = "Yes, close this tab"
+value = "yes"
+description = "Closes the tab and every pane in it"

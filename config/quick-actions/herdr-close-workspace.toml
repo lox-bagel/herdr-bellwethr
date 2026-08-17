@@ -1,0 +1,14 @@
+name = "Herdr: close workspace "
+description = "(prefix+shift+d): Close the selected workspace."
+type = "select"
+command = "case '{{.Value}}' in yes) herdr workspace close '{{.WorkspaceId}}' ;; *) : ;; esac"
+
+[[options]]
+label = "Cancel"
+value = "no"
+description = "Do nothing"
+
+[[options]]
+label = "Yes, close this workspace"
+value = "yes"
+description = "Closes the workspace and every tab and pane in it"

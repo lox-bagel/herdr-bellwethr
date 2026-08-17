@@ -1,0 +1,14 @@
+name = "Herdr: close pane      "
+description = "(prefix+x):       Close the focused pane."
+type = "select"
+command = "case '{{.Value}}' in yes) herdr pane close '{{.PaneId}}' ;; *) : ;; esac"
+
+[[options]]
+label = "Cancel"
+value = "no"
+description = "Do nothing"
+
+[[options]]
+label = "Yes, close this pane"
+value = "yes"
+description = "Closes the pane you opened the picker from"

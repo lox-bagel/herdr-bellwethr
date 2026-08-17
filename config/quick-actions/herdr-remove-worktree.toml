@@ -1,0 +1,14 @@
+name = "Herdr: remove worktree "
+description = "(unset):          Delete the selected managed worktree checkout after confirmation."
+type = "select"
+command = "case '{{.Value}}' in yes) herdr worktree remove --workspace '{{.WorkspaceId}}' ;; *) : ;; esac"
+
+[[options]]
+label = "Cancel"
+value = "no"
+description = "Do nothing"
+
+[[options]]
+label = "Yes, remove this worktree"
+value = "yes"
+description = "Deletes the worktree checkout from disk"

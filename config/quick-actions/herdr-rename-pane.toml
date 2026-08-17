@@ -1,0 +1,7 @@
+name = "Herdr: rename pane     "
+description = "(prefix+shift+p): Rename the focused pane."
+type = "form"
+command = "herdr pane rename '{{.PaneId}}' '{{.Value}}'"
+
+[form]
+prompt = "New pane label"

@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+#
+# herdr-project — save, list, and delete herdr-plus projects.
+#
+#   herdr-project save                     save the current space, named after it
+#   herdr-project save "Options Cafe"      save it under a different project name
+#   herdr-project save --stdout            print the TOML instead of writing it
+#   herdr-project list                     what is in the projects dir
+#   herdr-project delete "Options Cafe"    remove one
+#
+# `save` snapshots the space you are looking at — tabs, panes, split directions,
+# working dirs and the commands actually running — into one *.toml file in
+# herdr-plus's projects/ dir, so `prefix+shift+o` can rebuild it later.
+#
+# Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
+# never ~/.config/herdr/session.json — that file is a persistence detail and
+# lags the running session.
+
+"""Save, list, and delete herdr-plus project templates."""
+
+import argparse
+import json
+import os
+import os.path
+import re
+import shlex
+import subprocess
+import sys
+
+# herdr-plus caps a tab at 4 panes (maxPanesPerTab in its project.go) and only
+# understands these two split directions.
+MAX_PANES_PER_TAB = 4
+SPLIT_DOWN = "down"
+SPLIT_RIGHT = "right"
+
+# A pane sitting at its own prompt has no command worth recording. The pid test
+# below catches the pane's login shell; this list catches a shell started
+# *inside* it, which is just as uninteresting to replay.
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish"}
+
+PLUGIN_ID = "cloudmanic.herdr-plus"
+
+PROG = "herdr-project"
+
+# Set by --notify. Both the keybind and the quick-action launcher run this with
+# no terminal anyone will read — the launcher's output goes to the picker pane
+# herdr is about to tear down — so results have to reach the user through
+# herdr's own notifications.
+NOTIFY = False
+
+# What a failure notification calls itself; main() names the subcommand.
+FAIL_TITLE = "Herdr Plus: failed"
+
+
+def notify(title, body):
+    if not NOTIFY:
+        return
+    try:
+        subprocess.run(
+            ("herdr", "notification", "show", title, "--body", body, "--sound", "none"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def die(msg):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    notify(FAIL_TITLE, msg)
+    sys.exit(1)
+
+
+def warn(msg):
+    sys.stderr.write("%s: warning: %s\n" % (PROG, msg))
+
+
+# ------------------------------------------------------------------ herdr ---
+
+def herdr(*args):
+    """Run a herdr CLI command and return its `result` object.
+
+    The CLI reports failures in the JSON body and still exits 0, so the error
+    key has to be checked explicitly — a plain returncode test would sail past
+    'workspace not found' and hand back an empty snapshot.
+    """
+    try:
+        proc = subprocess.run(
+            ("herdr",) + args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        die("herdr is not on PATH")
+
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0 and not out:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        die("herdr %s failed: %s" % (" ".join(args), err or "exit %d" % proc.returncode))
+
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        die("herdr %s did not return JSON: %s" % (" ".join(args), out[:200]))
+
+    if "error" in payload:
+        e = payload["error"]
+        die("herdr %s: %s (%s)" % (" ".join(args), e.get("message", "failed"), e.get("code", "?")))
+    return payload.get("result", {})
+
+
+def plugin_config_dir():
+    """Where herdr-plus keeps projects/, asked of herdr rather than guessed.
+
+    herdr provisions this directory and keeps it across plugin upgrades, so it
+    is the same path the projects browser reads. Outside herdr the plugin falls
+    back to ~/.config/herdr-plus, and so do we.
+    """
+    try:
+        proc = subprocess.run(
+            ("herdr", "plugin", "config-dir", PLUGIN_ID),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        path = proc.stdout.decode("utf-8", "replace").strip()
+        if path and not path.startswith("{"):
+            return path
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "herdr-plus")
+
+
+def projects_dir(override):
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(plugin_config_dir(), "projects")
+
+
+# --------------------------------------------------------------- inventory --
+
+NAME_RE = re.compile(r'^\s*name\s*=\s*"((?:[^"\\]|\\.)*)"', re.MULTILINE)
+
+
+def project_name(path):
+    """The `name` a project file declares, or None if it declares none.
+
+    tomllib is the authority where it exists (3.11+); the regex fallback only
+    has to find one top-level string key, and stops at the first table so a
+    [[tabs]] name is never mistaken for the project's.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+
+    try:
+        import tomllib
+        try:
+            return (tomllib.loads(raw.decode("utf-8", "replace")).get("name") or "").strip() or None
+        except tomllib.TOMLDecodeError:
+            return None
+    except ImportError:
+        pass
+
+    text = raw.decode("utf-8", "replace").split("\n[", 1)[0]
+    match = NAME_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).replace('\\"', '"').replace("\\\\", "\\").strip() or None
+
+
+def load_projects(directory):
+    """Every saved project as (path, name), sorted by name."""
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return []
+
+    found = []
+    for entry in entries:
+        if not entry.endswith(".toml"):
+            continue
+        path = os.path.join(directory, entry)
+        if os.path.isdir(path):
+            continue
+        found.append((path, project_name(path)))
+    return sorted(found, key=lambda item: (item[1] or "").lower())
+
+
+def free_path(directory, slug):
+    """A file name no project is using yet.
+
+    The file name is an implementation detail — herdr-plus identifies a project
+    by its `name` — so a slug collision with an unrelated project is worked
+    around rather than reported, and never overwrites that project.
+    """
+    path = os.path.join(directory, slug + ".toml")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, "%s-%d.toml" % (slug, n))
+        n += 1
+    return path
+
+
+def match_projects(projects, query):
+    """Projects matching a name the user typed: exact first, then prefix.
+
+    Matching is case-insensitive because that is how herdr-plus's own `open`
+    resolves a name. The file's stem counts as a name too, so a project can be
+    named the way its file is.
+    """
+    wanted = query.strip().lower()
+    exact = [p for p in projects
+             if (p[1] or "").lower() == wanted
+             or os.path.splitext(os.path.basename(p[0]))[0].lower() == wanted]
+    if exact:
+        return exact
+    return [p for p in projects if (p[1] or "").lower().startswith(wanted)]
+
+
+def describe(projects):
+    return ", ".join(p[1] or os.path.basename(p[0]) for p in projects)
+
+
+# ------------------------------------------------------------------ picker --
+#
+# A fuzzy picker in the same spirit as herdr-plus's launcher: type to filter,
+# arrows to move, enter to choose. herdr-plus gets its picker pane from the
+# plugin system (see herdr-plugin.toml next to this script), which hands us a
+# real terminal and tears the pane down when we exit — so all this has to do is
+# draw on the tty it was given.
+
+def fuzzy_score(text, query):
+    """Rank a subsequence match, or None when the query does not fit.
+
+    Lower is better. An earlier first hit and a tighter run of characters win,
+    which is what makes typing "opt" land on "Options Cafe" ahead of a project
+    that merely contains those letters far apart.
+    """
+    if not query:
+        return (0, 0, len(text))
+
+    haystack = text.lower()
+    start = None
+    gaps = 0
+    position = 0
+    for char in query.lower():
+        found = haystack.find(char, position)
+        if found < 0:
+            return None
+        if start is None:
+            start = found
+        else:
+            gaps += found - position
+        position = found + 1
+    return (start, gaps, len(text))
+
+
+def fuzzy_filter(projects, query):
+    # No query, no ranking to do: keep the alphabetical order the list already
+    # has, rather than shuffling it by whatever the tie-breaker happens to be.
+    if not query:
+        return list(projects)
+
+    ranked = []
+    for project in projects:
+        label = project[1] or os.path.basename(project[0])
+        score = fuzzy_score(label, query)
+        if score is None:
+            # Fall back to the file name so a project can be found by the file
+            # it lives in, the same way `delete <name>` accepts a file stem.
+            score = fuzzy_score(os.path.basename(project[0]), query)
+            if score is None:
+                continue
+            score = (score[0] + 100,) + score[1:]
+        ranked.append((score, project))
+    ranked.sort(key=lambda item: item[0])
+    return [project for _, project in ranked]
+
+
+class Tty(object):
+    """Raw-mode access to the controlling terminal.
+
+    Reading /dev/tty rather than stdin keeps the picker working when output is
+    piped, and raw mode is what makes single keystrokes arrive without Enter.
+    """
+
+    def __init__(self):
+        self.handle = None
+        self.saved = None
+
+    def __enter__(self):
+        import termios, tty
+        self.handle = open("/dev/tty", "r+b", buffering=0)
+        self.saved = termios.tcgetattr(self.handle.fileno())
+        tty.setraw(self.handle.fileno())
+        self.write("\033[?25l")           # hide the cursor while we paint
+        return self
+
+    def __exit__(self, *_):
+        import termios
+        self.write("\033[?25h\033[2J\033[H")
+        termios.tcsetattr(self.handle.fileno(), termios.TCSADRAIN, self.saved)
+        self.handle.close()
+
+    def write(self, text):
+        self.handle.write(text.encode("utf-8"))
+
+    def key(self):
+        """One keystroke: a character, or a name like 'up' / 'enter' / 'esc'.
+
+        An escape byte is ambiguous — a bare Esc, or the start of an arrow
+        sequence — so a short poll decides which. Without the timeout, Esc
+        would hang until the next keypress.
+        """
+        import select
+        first = self.handle.read(1)
+        if not first:
+            return "esc"
+        if first == b"\x1b":
+            ready, _, _ = select.select([self.handle], [], [], 0.05)
+            if not ready:
+                return "esc"
+            rest = self.handle.read(1)
+            if rest in (b"[", b"O"):
+                final = self.handle.read(1)
+                return {b"A": "up", b"B": "down"}.get(final, "")
+            return ""
+        if first in (b"\r", b"\n"):
+            return "enter"
+        if first in (b"\x7f", b"\x08"):
+            return "backspace"
+        if first == b"\x03":
+            return "esc"
+        if first == b"\x15":
+            return "clear"
+        if first == b"\x0e":
+            return "down"
+        if first == b"\x10":
+            return "up"
+        try:
+            char = first.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return char if char.isprintable() else ""
+
+
+def pick_project(projects, title):
+    """Fuzzy-pick one project, or None if the user backed out."""
+    query = ""
+    selected = 0
+
+    with Tty() as tty_io:
+        while True:
+            shown = fuzzy_filter(projects, query)
+            if not shown:
+                selected = 0
+            else:
+                selected = max(0, min(selected, len(shown) - 1))
+
+            width = max([len(p[1] or "?") for p in projects] + [4])
+            lines = ["\033[2J\033[H",
+                     "  \033[1m%s\033[0m\r\n\r\n" % title,
+                     "  > %s\033[7m \033[0m\r\n\r\n" % query]
+            if not shown:
+                lines.append("    \033[2mno project matches\033[0m\r\n")
+            for i, (path, name) in enumerate(shown):
+                label = name or "(unnamed)"
+                if i == selected:
+                    lines.append("  \033[32m❯\033[0m \033[1m%-*s\033[0m  \033[2m%s\033[0m\r\n"
+                                 % (width, label, os.path.basename(path)))
+                else:
+                    lines.append("    %-*s  \033[2m%s\033[0m\r\n"
+                                 % (width, label, os.path.basename(path)))
+            lines.append("\r\n  \033[2mtype to filter · ↑/↓ move · enter select · esc cancel\033[0m\r\n")
+            tty_io.write("".join(lines))
+
+            key = tty_io.key()
+            if key == "esc":
+                return None
+            if key == "enter":
+                if not shown:
+                    continue
+                chosen = shown[selected]
+                if confirm(tty_io, "delete %r?" % (chosen[1] or os.path.basename(chosen[0]))):
+                    return chosen
+                return None
+            if key == "up":
+                selected -= 1
+            elif key == "down":
+                selected += 1
+            elif key == "backspace":
+                query = query[:-1]
+            elif key == "clear":
+                query = ""
+            elif key:
+                query += key
+
+
+def confirm(tty_io, question):
+    """A y/N keystroke. Deleting is one keypress away, so it asks first."""
+    tty_io.write("\r\n  %s \033[2m[y/N]\033[0m " % question)
+    return tty_io.key().lower() == "y"
+
+
+# --------------------------------------------------------------- processes --
+
+def ancestor_pids():
+    """Every pid between this process and init, for self-recognition.
+
+    Whatever is running this script shows up as some pane's foreground process;
+    without this the saved project would tell herdr to re-run the saver.
+    """
+    pids = set()
+    pid = os.getpid()
+    for _ in range(64):
+        pids.add(pid)
+        try:
+            out = subprocess.run(
+                ("ps", "-o", "ppid=", "-p", str(pid)),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ).stdout.decode().strip()
+            parent = int(out.split()[0])
+        except (ValueError, IndexError):
+            break
+        if parent <= 1 or parent in pids:
+            break
+        pid = parent
+    return pids
+
+
+def plugin_roots():
+    """Install directories of every herdr plugin, for spotting plugin panes."""
+    result = herdr("plugin", "list", "--json")
+    roots = set()
+    for plugin in result.get("plugins", []):
+        for key in ("plugin_root", "manifest_path"):
+            path = plugin.get(key)
+            if key == "manifest_path" and path:
+                path = os.path.dirname(path)
+            if path:
+                roots.add(os.path.normpath(path))
+        source = plugin.get("source") or {}
+        if source.get("managed_path"):
+            roots.add(os.path.normpath(source["managed_path"]))
+    return roots
+
+
+def pane_process(pane_id):
+    return herdr("pane", "process-info", "--pane", pane_id).get("process_info", {})
+
+
+def is_plugin_pane(pane, info, roots):
+    """True for a pane herdr opened to host plugin UI.
+
+    The quick-action launcher and the projects browser run as herdr-managed
+    panes, and while one is open it is a pane of the space like any other — so
+    saving from the launcher would write the launcher itself into the project.
+    They give themselves away by having no shell: the pane's root process *is*
+    the plugin binary, run out of the plugin's install directory.
+    """
+    if not roots:
+        return False
+    shell_pid = info.get("shell_pid")
+    for proc in info.get("foreground_processes", []):
+        if proc.get("pid") != shell_pid:
+            continue
+        argv = proc.get("argv") or []
+        if not argv:
+            break
+        exe = argv[0]
+        cwd = proc.get("cwd") or ""
+        if not os.path.isabs(exe):
+            exe = os.path.normpath(os.path.join(cwd, exe))
+        if any(exe == root or exe.startswith(root + os.sep) for root in roots):
+            return True
+        # Windows plugin panes go through powershell, so the binary is not
+        # argv[0]; there the plugin root shows up as the pane's directory.
+        if os.path.basename(argv[0]) not in SHELLS:
+            cwd = os.path.normpath(cwd) if cwd else ""
+            return any(cwd == root or cwd.startswith(root + os.sep) for root in roots)
+        break
+    return False
+
+
+def pane_command(info, is_agent, ancestors):
+    """The command to replay in this pane, or None for a plain shell.
+
+    A pane's login shell is identified by pid, not by name: a pane running
+    `bash -c ...` deliberately is worth keeping, an idle prompt is not.
+    """
+    shell_pid = info.get("shell_pid")
+    for proc in info.get("foreground_processes", []):
+        if proc.get("pid") == shell_pid:
+            continue
+        argv = proc.get("argv") or []
+        if not argv:
+            continue
+        # Our own process tree, in a pane with no agent, is this script being
+        # run from a shell — nothing to record. An agent pane is different:
+        # `claude` is genuinely what that pane runs, even when it is the one
+        # calling us.
+        if proc.get("pid") in ancestors and not is_agent:
+            return None
+        if os.path.basename(argv[0]) in SHELLS:
+            continue
+        return " ".join(shlex.quote(a) for a in argv)
+    return None
+
+
+# ------------------------------------------------------------------ layout --
+
+def split_tree(panes):
+    """Rebuild a tab's split tree from pane geometry.
+
+    herdr's layout response carries a flat `splits` list whose tree structure
+    lives only in generated ids; the rectangles say the same thing without
+    depending on that naming. Returns a leaf {'pane': p} or a node
+    {'dir', 'first', 'second'}, or None if the panes do not tile cleanly.
+    """
+    if len(panes) == 1:
+        return {"pane": panes[0]}
+
+    def cut(axis, size, direction):
+        edges = sorted({p["rect"][axis] for p in panes})
+        for edge in edges[1:]:
+            first = [p for p in panes if p["rect"][axis] < edge]
+            second = [p for p in panes if p["rect"][axis] >= edge]
+            if not first or not second:
+                continue
+            if all(p["rect"][axis] + p["rect"][size] <= edge for p in first):
+                left, right = split_tree(first), split_tree(second)
+                if left and right:
+                    return {"dir": direction, "first": left, "second": right}
+        return None
+
+    # Try the side-by-side cut first; either one alone identifies the split.
+    return cut("x", "width", SPLIT_RIGHT) or cut("y", "height", SPLIT_DOWN)
+
+
+def prune_tree(node, drop):
+    """Drop panes from a split tree, collapsing the splits they leave behind.
+
+    Pruning the tree rather than the pane list keeps the surviving panes'
+    geometry intact: a split with one child left simply becomes that child.
+    """
+    if node is None:
+        return None
+    if "pane" in node:
+        return None if node["pane"]["pane_id"] in drop else node
+    first = prune_tree(node["first"], drop)
+    second = prune_tree(node["second"], drop)
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return {"dir": node["dir"], "first": first, "second": second}
+
+
+def pane_chain(node):
+    """Flatten a split tree into herdr-plus's linear pane list.
+
+    A project builds panes in order, each one splitting off the *previous*
+    pane, so the tree is reproduced exactly when every split's first side is a
+    single pane. Anything else (a stacked pair beside a third pane, say) is
+    flattened to the nearest chain and reported as approximate.
+    """
+    if "pane" in node:
+        return [(node["pane"], None)], True
+
+    first, first_exact = pane_chain(node["first"])
+    second, second_exact = pane_chain(node["second"])
+    head, _ = second[0]
+    second = [(head, node["dir"])] + second[1:]
+    exact = first_exact and second_exact and "pane" in node["first"]
+    return first + second, exact
+
+
+# -------------------------------------------------------------------- toml --
+
+def toml_string(value):
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    out = out.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return '"%s"' % out
+
+
+def tilde(path, home):
+    if home and (path == home or path.startswith(home + os.sep)):
+        return "~" + path[len(home):]
+    return path
+
+
+def shell_path(path, home):
+    """Quote a path for a shell command, keeping ~ expandable.
+
+    `cd '~/src'` would try to enter a directory literally named ~, so the tilde
+    has to stay outside the quotes: `cd ~/'src'`. Keeping it (rather than
+    writing the absolute path) is what lets the saved project open on another
+    machine with a different home.
+    """
+    short = tilde(path, home)
+    if short == "~":
+        return "~"
+    if short.startswith("~/"):
+        return "~/" + shlex.quote(short[2:])
+    return shlex.quote(short)
+
+
+def slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "space"
+
+
+# ----------------------------------------------------------------- capture --
+
+def resolve_space(requested):
+    """Pick the space to save: --space, else the caller's, else the focused one."""
+    workspaces = herdr("workspace", "list").get("workspaces", [])
+    if not workspaces:
+        die("herdr reports no spaces")
+
+    wanted = requested or os.environ.get("HERDR_PLUS_WORKSPACE_ID") \
+        or os.environ.get("HERDR_WORKSPACE_ID")
+    if wanted:
+        for ws in workspaces:
+            if ws["workspace_id"] == wanted:
+                return ws
+        if requested:
+            # Allow --space to name a space the way the sidebar labels it.
+            matches = [w for w in workspaces if w.get("label") == requested]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                die("more than one space is labeled %r; use its id" % requested)
+            die("no space %r (have: %s)" % (
+                requested, ", ".join("%s (%s)" % (w["workspace_id"], w.get("label", "")) for w in workspaces)))
+
+    for ws in workspaces:
+        if ws.get("focused"):
+            return ws
+    return workspaces[0]
+
+
+def tab_name(tab, panes, commands):
+    """A tab needs a name; herdr only has one when the user set one.
+
+    An unnamed tab reports its display number as the label, which says nothing
+    in a template, so fall back to what the tab actually contains.
+    """
+    label = (tab.get("label") or "").strip()
+    if label and not label.isdigit():
+        return label
+    for pane in panes:
+        if pane.get("agent"):
+            return pane["agent"]
+    for command in commands:
+        if command:
+            return os.path.basename(shlex.split(command)[0])
+    return "terminal"
+
+
+def capture(space, args):
+    ws_id = space["workspace_id"]
+    ancestors = ancestor_pids()
+    roots = plugin_roots()
+    home = os.path.expanduser("~")
+
+    tabs = herdr("tab", "list", "--workspace", ws_id).get("tabs", [])
+    if not tabs:
+        die("space %s has no tabs" % ws_id)
+
+    all_panes = herdr("pane", "list", "--workspace", ws_id).get("panes", [])
+    by_tab = {}
+    for pane in all_panes:
+        by_tab.setdefault(pane["tab_id"], []).append(pane)
+
+    captured = []
+    for tab in tabs:
+        panes = by_tab.get(tab["tab_id"], [])
+        if not panes:
+            warn("tab %s has no panes; skipped" % tab["tab_id"])
+            continue
+
+        processes = {p["pane_id"]: pane_process(p["pane_id"]) for p in panes}
+        transient = {p["pane_id"] for p in panes
+                     if is_plugin_pane(p, processes[p["pane_id"]], roots)}
+        keep = [p for p in panes if p["pane_id"] not in transient]
+        if not keep:
+            # Nothing here but plugin UI — a picker in a tab of its own is not
+            # something a template should rebuild.
+            continue
+
+        layout = herdr("pane", "layout", "--pane", panes[0]["pane_id"]).get("layout", {})
+        geometry = {p["pane_id"]: p for p in layout.get("panes", [])}
+        placed = [geometry[p["pane_id"]] for p in panes if p["pane_id"] in geometry]
+
+        if len(placed) != len(panes):
+            warn("tab %s: layout is missing pane geometry; keeping pane order" % tab["tab_id"])
+            chain = [(p["pane_id"], None if i == 0 else SPLIT_DOWN)
+                     for i, p in enumerate(keep)]
+        else:
+            # The tree is built from every pane, including the transient ones,
+            # so the geometry still tiles; they are pruned out afterwards.
+            tree = prune_tree(split_tree(placed), transient)
+            if tree is None:
+                warn("tab %s: could not read the split layout; stacking panes" % tab["tab_id"])
+                chain = [(p["pane_id"], None if i == 0 else SPLIT_DOWN)
+                         for i, p in enumerate(keep)]
+            else:
+                ordered, exact = pane_chain(tree)
+                if not exact:
+                    warn("tab %s: nested splits flattened — herdr-plus builds each pane "
+                         "off the previous one, so the rebuilt layout is close, not identical"
+                         % tab["tab_id"])
+                chain = [(p["pane_id"], d) for p, d in ordered]
+
+        for split in layout.get("splits", []):
+            ratio = split.get("ratio", 0.5)
+            if abs(ratio - 0.5) > 0.05:
+                warn("tab %s: split ratio %.2f is not part of the project format; "
+                     "panes rebuild evenly" % (tab["tab_id"], ratio))
+                break
+
+        info = {p["pane_id"]: p for p in panes}
+        entries = []
+        for pane_id, split in chain:
+            pane = info[pane_id]
+            command = pane_command(processes[pane_id], bool(pane.get("agent")), ancestors)
+            entries.append({
+                "command": command,
+                "split": split,
+                "label": (pane.get("label") or "").strip(),
+                "cwd": pane.get("cwd") or "",
+            })
+
+        if len(entries) > MAX_PANES_PER_TAB:
+            warn("tab %s has %d panes; herdr-plus allows %d, dropping the last %d"
+                 % (tab["tab_id"], len(entries), MAX_PANES_PER_TAB,
+                    len(entries) - MAX_PANES_PER_TAB))
+            entries = entries[:MAX_PANES_PER_TAB]
+
+        captured.append({
+            "name": tab_name(tab, keep, [e["command"] for e in entries]),
+            "panes": entries,
+        })
+
+    if not captured:
+        die("space %s has nothing to save" % ws_id)
+
+    working_dir = args.working_dir or captured[0]["panes"][0]["cwd"] or home
+
+    # A project has one working_dir; herdr-plus has no per-pane cwd. Panes that
+    # sit somewhere else get a `cd` in front of their command, which works
+    # because herdr-plus types the command into the pane's shell — a bare `cd`
+    # leaves an interactive shell in the right place.
+    if not args.no_cd:
+        for tab in captured:
+            for entry in tab["panes"]:
+                cwd = entry["cwd"]
+                if not cwd or cwd == working_dir:
+                    continue
+                prefix = "cd %s" % shell_path(cwd, home)
+                entry["command"] = ("%s && %s" % (prefix, entry["command"])
+                                    if entry["command"] else prefix)
+
+    return {
+        "name": args.name or space.get("label") or ws_id,
+        "description": args.description,
+        "group": args.group,
+        "working_dir": tilde(working_dir, home),
+        "tabs": captured,
+        "source": "%s (%s)" % (space.get("label") or ws_id, ws_id),
+    }
+
+
+def render(project):
+    lines = [
+        "# herdr-plus project saved from herdr space %s." % project["source"],
+        "# Written by %s — a plain template, edit it freely." % PROG,
+        "",
+        "name = %s" % toml_string(project["name"]),
+    ]
+    if project["description"]:
+        lines.append("description = %s" % toml_string(project["description"]))
+    if project["group"]:
+        lines.append("group = %s" % toml_string(project["group"]))
+    lines.append("working_dir = %s" % toml_string(project["working_dir"]))
+
+    for tab in project["tabs"]:
+        panes = tab["panes"]
+        lines += ["", "[[tabs]]", "name = %s" % toml_string(tab["name"])]
+
+        # One pane is the single-command shorthand; a split tab must use
+        # [[tabs.panes]], and setting both is a load-time error in herdr-plus.
+        if len(panes) == 1:
+            pane = panes[0]
+            if pane["label"]:
+                # A labeled pane needs a pane table even when it is alone: a
+                # tab has no label field of its own.
+                lines += ["", "[[tabs.panes]]", "label = %s" % toml_string(pane["label"])]
+                if pane["command"]:
+                    lines.append("command = %s" % toml_string(pane["command"]))
+            elif pane["command"]:
+                lines.append("command = %s" % toml_string(pane["command"]))
+            else:
+                lines.append("# no command — just an empty shell")
+            continue
+
+        for i, pane in enumerate(panes):
+            lines += ["", "[[tabs.panes]]"]
+            if pane["label"]:
+                lines.append("label = %s" % toml_string(pane["label"]))
+            if pane["command"]:
+                lines.append("command = %s" % toml_string(pane["command"]))
+            elif not pane["label"]:
+                lines.append("# no command — just an empty shell")
+            if i > 0:
+                lines.append("split = %s" % toml_string(pane["split"] or SPLIT_DOWN))
+
+    return "\n".join(lines) + "\n"
+
+
+def check(text, path):
+    """Parse what we just produced, so a bad file never reaches the browser.
+
+    herdr-plus fails the *whole* projects load on one malformed file, which
+    would take the user's other projects down with it.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        die("generated TOML for %s is invalid (%s) — please report this" % (path, exc))
+
+
+# ------------------------------------------------------------- subcommands --
+
+def cmd_save(args):
+    space = resolve_space(args.space)
+    project = capture(space, args)
+    text = render(project)
+
+    if args.stdout:
+        check(text, "<stdout>")
+        sys.stdout.write(text)
+        return
+
+    tabs = ", ".join("%s%s" % (t["name"], " x%d" % len(t["panes"]) if len(t["panes"]) > 1 else "")
+                     for t in project["tabs"])
+
+    if args.out:
+        path = os.path.expanduser(args.out)
+        replacing = os.path.exists(path)
+        if replacing and not args.force:
+            die("%s already exists (use --force to overwrite)" % path)
+    else:
+        directory = projects_dir(args.projects_dir)
+        # herdr-plus identifies a project by its name — two files claiming one
+        # name give you two identical-looking rows in the browser and make
+        # `herdr-plus open <name>` a coin toss. So the name, not the file name,
+        # is what has to be unique.
+        clashes = [p for p in load_projects(directory)
+                   if (p[1] or "").lower() == project["name"].strip().lower()]
+        if clashes and not args.force:
+            die("a project named %r already exists (%s) — choose another name, or "
+                'overwrite it with --force (the "Plus: save project" action)'
+                % (project["name"], os.path.basename(clashes[0][0])))
+        if len(clashes) > 1:
+            warn("%d files are named %r; overwriting %s and leaving the rest"
+                 % (len(clashes), project["name"], os.path.basename(clashes[0][0])))
+        replacing = bool(clashes)
+        path = clashes[0][0] if clashes else free_path(directory, slugify(project["name"]))
+
+    check(text, path)
+
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+    except OSError as exc:
+        die("could not write %s: %s" % (path, exc))
+
+    verb = "overwrote" if replacing else "saved"
+    print("%s %r -> %s" % (verb, project["name"], path))
+    print("  %s" % tabs)
+    notify("Herdr Plus: project %s" % ("overwritten" if replacing else "saved"),
+           "%s — %s" % (project["name"], tabs))
+
+
+def cmd_list(args):
+    directory = projects_dir(args.projects_dir)
+    projects = load_projects(directory)
+    if not projects:
+        print("no saved projects in %s" % directory)
+        return
+    width = max(len(p[1] or "?") for p in projects)
+    for path, name in projects:
+        print("  %-*s  %s" % (width, name or "(unnamed)", os.path.basename(path)))
+
+
+def cmd_delete(args):
+    directory = projects_dir(args.projects_dir)
+    projects = load_projects(directory)
+    if not projects:
+        die("no saved projects in %s" % directory)
+
+    if args.pick or not args.name:
+        if not os.path.exists("/dev/tty"):
+            die("--pick needs a terminal; pass a project name instead")
+        try:
+            chosen = pick_project(projects, "Delete a Herdr Plus project")
+        except (OSError, ImportError) as exc:
+            die("could not open the picker (%s); pass a project name instead" % exc)
+        if chosen is None:
+            print("cancelled")
+            return
+        matches = [chosen]
+    else:
+        # An empty name prefix-matches everything, and with a single saved
+        # project that would silently delete it. A blank form is not a delete.
+        if not args.name.strip():
+            die("name a project to delete (saved: %s)" % describe(projects))
+
+        matches = match_projects(projects, args.name)
+        if not matches:
+            die("no project matching %r (have: %s)" % (args.name, describe(projects)))
+        if len(matches) > 1:
+            die("%r matches more than one project (%s) — use the full name"
+                % (args.name, describe(matches)))
+
+    path, name = matches[0]
+    try:
+        os.remove(path)
+    except OSError as exc:
+        die("could not delete %s: %s" % (path, exc))
+
+    label = name or os.path.basename(path)
+    print("deleted %r (%s)" % (label, path))
+    notify("Herdr Plus: project deleted", "%s — %s" % (label, os.path.basename(path)))
+
+
+# -------------------------------------------------------------------- main --
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Save, list, and delete herdr-plus project templates.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    def shared(sub):
+        sub.add_argument("--projects-dir", metavar="DIR",
+                         help="projects directory (default: herdr-plus's own)")
+        sub.add_argument("--notify", action="store_true",
+                         help="report the result as a herdr notification (for keybinds "
+                              "and quick actions, which have no terminal to print to)")
+
+    save = subparsers.add_parser(
+        "save", help="save a space as a project",
+        description="Save a live herdr space as a herdr-plus project template.",
+        epilog="With no options it saves the space you are in, named after it. Reopen it "
+               "from the projects browser (prefix+shift+o) or with `herdr-plus open <name>`.")
+    save.add_argument("name", nargs="?", help="project name (default: the space's label)")
+    save.add_argument("--space", metavar="ID", help="space to save, by id or label "
+                      "(default: the current space, else the focused one)")
+    save.add_argument("--group", metavar="TEXT", help="group heading in the projects browser")
+    save.add_argument("--description", metavar="TEXT", help="project description")
+    save.add_argument("--working-dir", metavar="PATH",
+                      help="project working_dir (default: the first pane's cwd)")
+    save.add_argument("--out", metavar="FILE", help="write here instead of the projects dir")
+    save.add_argument("--stdout", action="store_true", help="print the TOML, write nothing")
+    save.add_argument("--force", action="store_true",
+                      help="overwrite the project that already has this name")
+    save.add_argument("--no-cd", action="store_true",
+                      help="skip the `cd` prefix for panes outside working_dir")
+    shared(save)
+    save.set_defaults(func=cmd_save)
+
+    listing = subparsers.add_parser("list", help="list saved projects",
+                                    description="List the saved herdr-plus projects.")
+    shared(listing)
+    listing.set_defaults(func=cmd_list)
+
+    delete = subparsers.add_parser(
+        "delete", help="delete a saved project",
+        description="Delete a saved herdr-plus project by name.",
+        epilog="The name is matched case-insensitively, exactly or by prefix; a prefix "
+               "that matches several projects is refused rather than guessed.")
+    delete.add_argument("name", nargs="?", default="",
+                        help="project name (or its file name); omit to fuzzy-pick one")
+    delete.add_argument("--pick", action="store_true",
+                        help="always show the fuzzy picker, ignoring any name given")
+    shared(delete)
+    delete.set_defaults(func=cmd_delete)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(2)
+
+    global NOTIFY, FAIL_TITLE
+    NOTIFY = args.notify
+    FAIL_TITLE = "Herdr Plus: %s failed" % args.command
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

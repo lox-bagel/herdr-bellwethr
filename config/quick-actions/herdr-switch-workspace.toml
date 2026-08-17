@@ -1,0 +1,7 @@
+name = "Herdr: switch workspace"
+description = "(unset):          Switch to workspace 1-9 from prefix mode."
+type = "form"
+command = "herdr workspace focus '{{.Value}}'"
+
+[form]
+prompt = "Workspace id (e.g. w2)"

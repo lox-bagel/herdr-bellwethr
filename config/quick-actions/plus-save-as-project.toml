@@ -1,0 +1,7 @@
+name = "Plus: save as project  "
+description = "(unset):          Save this space as a new, named project."
+type = "form"
+command = "herdr-project save --space '{{.WorkspaceId}}' --notify '{{.Value}}'"
+
+[form]
+prompt = "New project name (blank = space label)"

@@ -1,0 +1,4 @@
+name = "Herdr: split vertical  "
+description = "(prefix+v):       Split pane vertically (side by side)."
+type = "command"
+command = "herdr pane split --pane '{{.PaneId}}' --direction right --focus"

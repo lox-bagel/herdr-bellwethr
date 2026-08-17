@@ -1,0 +1,4 @@
+name = "Lazy: sync plugins     "
+description = "(unset):          Install what is missing, refresh the lock."
+type = "command"
+command = "herdr plugin action invoke herdr-lazy.sync"

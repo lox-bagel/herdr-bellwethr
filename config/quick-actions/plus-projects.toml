@@ -1,0 +1,4 @@
+name = "Plus: projects         "
+description = "(prefix+shift+o): Open the Herdr Plus project browser."
+type = "command"
+command = "herdr plugin action invoke cloudmanic.herdr-plus.projects"

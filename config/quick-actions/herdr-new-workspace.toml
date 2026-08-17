@@ -1,0 +1,4 @@
+name = "Herdr: new workspace   "
+description = "(prefix+shift+n): Create a new workspace."
+type = "command"
+command = "herdr workspace create --cwd '{{.WorkDir}}'"

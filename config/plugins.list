@@ -1,0 +1,8 @@
+# herdr-lazy bundle — your declarative plugin set.
+# One `owner/repo` per line. `#` starts a comment.
+# Curated defaults below; edit to taste, then run `herdr-lazy sync`.
+
+natori-hrj/herdr-lazy
+cloudmanic/herdr-plus
+persiyanov/herdr-reviewr
+qu8n/herdr-automatic-rename

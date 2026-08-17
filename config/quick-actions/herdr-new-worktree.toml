@@ -1,0 +1,7 @@
+name = "Herdr: new worktree    "
+description = "(prefix+shift+g): Create a Git worktree from the selected workspace."
+type = "form"
+command = "herdr worktree create --cwd '{{.WorkDir}}' --branch '{{.Value}}'"
+
+[form]
+prompt = "Branch name (blank = auto)"

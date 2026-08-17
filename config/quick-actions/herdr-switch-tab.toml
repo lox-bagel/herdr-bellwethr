@@ -1,0 +1,7 @@
+name = "Herdr: switch tab      "
+description = "(prefix+1..9):    Switch to tab 1-9."
+type = "form"
+command = "herdr tab focus '{{.Value}}'"
+
+[form]
+prompt = "Tab id (e.g. w1:t2)"
