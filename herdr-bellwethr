@@ -12,21 +12,11 @@
 #   herdr-bellwethr dispatch "<task>" --branch feat/x    hand it to an agent
 #   herdr-bellwethr reap                     worktrees that look finished with
 #
-# `save` snapshots the space you are looking at — tabs, panes, split directions,
-# working dirs and the commands actually running — into one *.toml file in
-# herdr-plus's projects/ dir, so `prefix+shift+o` can rebuild it later.
-#
-# `dispatch` is the other direction: a worktree, an agent started in it, and the
-# task handed over once herdr reports the agent ready. It never invents a branch
-# name — which names a repo accepts is the repo's business, so `conventions`
-# reports the evidence and the caller chooses. `reap` clears up afterwards, and
-# removes nothing until told to.
-#
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
 # lags the running session.
 
-"""Save, list, and delete herdr-plus project templates."""
+"""Save herdr-plus projects, and dispatch agents into worktrees."""
 
 import argparse
 import json
@@ -44,25 +34,22 @@ MAX_PANES_PER_TAB = 4
 SPLIT_DOWN = "down"
 SPLIT_RIGHT = "right"
 
-# A pane sitting at its own prompt has no command worth recording. The pid test
-# below catches the pane's login shell; this list catches a shell started
-# *inside* it, which is just as uninteresting to replay.
+# Catches a shell started *inside* a pane; the pid test below catches the
+# pane's own login shell.
 SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish"}
 
-# The plugin whose config dir holds projects/ — herdr-plus, not this one. The
-# projects browser reads them, we write them, so the path has to be its dir.
+# herdr-plus, not this plugin: its config dir is where projects/ lives, and its
+# browser is what reads them.
 PLUS_ID = "cloudmanic.herdr-plus"
 
 PROG = "herdr-bellwethr"
 
-# Set by --notify. Both the keybind and the quick-action launcher run this with
-# no terminal anyone will read — the launcher's output goes to the picker pane
-# herdr is about to tear down — so results have to reach the user through
-# herdr's own notifications.
+# Set by --notify. Keybinds and launcher actions have no terminal anyone will
+# read, so results have to reach the user as herdr notifications instead.
 NOTIFY = False
 
-# What a failure notification calls itself; main() names the subcommand.
-FAIL_TITLE = "Herdr Plus: failed"
+# main() replaces this with one naming the subcommand.
+FAIL_TITLE = "Herdr Bellwethr: failed"
 
 
 def notify(title, body):
@@ -92,9 +79,8 @@ def warn(msg):
 def herdr(*args):
     """Run a herdr CLI command and return its `result` object.
 
-    The CLI reports failures in the JSON body and still exits 0, so the error
-    key has to be checked explicitly — a plain returncode test would sail past
-    'workspace not found' and hand back an empty snapshot.
+    The CLI reports failures in the JSON body and still exits 0, so a plain
+    returncode test would sail past 'workspace not found' with an empty result.
     """
     try:
         proc = subprocess.run(
@@ -123,9 +109,7 @@ def herdr(*args):
 def plugin_config_dir():
     """Where herdr-plus keeps projects/, asked of herdr rather than guessed.
 
-    herdr provisions this directory and keeps it across plugin upgrades, so it
-    is the same path the projects browser reads. Outside herdr the plugin falls
-    back to ~/.config/herdr-plus, and so do we.
+    Outside herdr the plugin falls back to ~/.config/herdr-plus, and so do we.
     """
     try:
         proc = subprocess.run(
@@ -156,9 +140,8 @@ NAME_RE = re.compile(r'^\s*name\s*=\s*"((?:[^"\\]|\\.)*)"', re.MULTILINE)
 def project_name(path):
     """The `name` a project file declares, or None if it declares none.
 
-    tomllib is the authority where it exists (3.11+); the regex fallback only
-    has to find one top-level string key, and stops at the first table so a
-    [[tabs]] name is never mistaken for the project's.
+    The pre-3.11 regex fallback stops at the first table, so a [[tabs]] name is
+    never mistaken for the project's.
     """
     try:
         with open(path, "rb") as handle:
@@ -203,9 +186,8 @@ def load_projects(directory):
 def free_path(directory, slug):
     """A file name no project is using yet.
 
-    The file name is an implementation detail — herdr-plus identifies a project
-    by its `name` — so a slug collision with an unrelated project is worked
-    around rather than reported, and never overwrites that project.
+    herdr-plus identifies a project by its `name`, so a slug collision is worked
+    around rather than reported.
     """
     path = os.path.join(directory, slug + ".toml")
     n = 2
@@ -218,9 +200,7 @@ def free_path(directory, slug):
 def match_projects(projects, query):
     """Projects matching a name the user typed: exact first, then prefix.
 
-    Matching is case-insensitive because that is how herdr-plus's own `open`
-    resolves a name. The file's stem counts as a name too, so a project can be
-    named the way its file is.
+    Case-insensitive, matching herdr-plus's own `open`. A file stem counts too.
     """
     wanted = query.strip().lower()
     exact = [p for p in projects
@@ -237,18 +217,13 @@ def describe(projects):
 
 # ------------------------------------------------------------------ picker --
 #
-# A fuzzy picker in the same spirit as herdr-plus's launcher: type to filter,
-# arrows to move, enter to choose. herdr-plus gets its picker pane from the
-# plugin system (see herdr-plugin.toml next to this script), which hands us a
-# real terminal and tears the pane down when we exit — so all this has to do is
-# draw on the tty it was given.
+# herdr-plugin.toml hands this a real terminal as a plugin pane and tears it
+# down on exit, so all this has to do is draw on the tty it was given.
 
 def fuzzy_score(text, query):
     """Rank a subsequence match, or None when the query does not fit.
 
-    Lower is better. An earlier first hit and a tighter run of characters win,
-    which is what makes typing "opt" land on "Options Cafe" ahead of a project
-    that merely contains those letters far apart.
+    Lower is better: an earlier first hit and a tighter run of characters win.
     """
     if not query:
         return (0, 0, len(text))
@@ -270,8 +245,7 @@ def fuzzy_score(text, query):
 
 
 def fuzzy_filter(projects, query):
-    # No query, no ranking to do: keep the alphabetical order the list already
-    # has, rather than shuffling it by whatever the tie-breaker happens to be.
+    # No query, no ranking: keep the alphabetical order the list already has.
     if not query:
         return list(projects)
 
@@ -280,8 +254,7 @@ def fuzzy_filter(projects, query):
         label = project[1] or os.path.basename(project[0])
         score = fuzzy_score(label, query)
         if score is None:
-            # Fall back to the file name so a project can be found by the file
-            # it lives in, the same way `delete <name>` accepts a file stem.
+            # Findable by file name too, as `delete <name>` allows.
             score = fuzzy_score(os.path.basename(project[0]), query)
             if score is None:
                 continue
@@ -294,8 +267,7 @@ def fuzzy_filter(projects, query):
 class Tty(object):
     """Raw-mode access to the controlling terminal.
 
-    Reading /dev/tty rather than stdin keeps the picker working when output is
-    piped, and raw mode is what makes single keystrokes arrive without Enter.
+    /dev/tty rather than stdin, so the picker still works when output is piped.
     """
 
     def __init__(self):
@@ -322,9 +294,8 @@ class Tty(object):
     def key(self):
         """One keystroke: a character, or a name like 'up' / 'enter' / 'esc'.
 
-        An escape byte is ambiguous — a bare Esc, or the start of an arrow
-        sequence — so a short poll decides which. Without the timeout, Esc
-        would hang until the next keypress.
+        An escape byte is ambiguous — bare Esc, or the start of an arrow
+        sequence — so a short poll decides which; without it Esc would hang.
         """
         import select
         first = self.handle.read(1)
@@ -411,7 +382,7 @@ def pick_project(projects, title):
 
 
 def confirm(tty_io, question):
-    """A y/N keystroke. Deleting is one keypress away, so it asks first."""
+    """A y/N keystroke."""
     tty_io.write("\r\n  %s \033[2m[y/N]\033[0m " % question)
     return tty_io.key().lower() == "y"
 
@@ -419,10 +390,10 @@ def confirm(tty_io, question):
 # --------------------------------------------------------------- processes --
 
 def ancestor_pids():
-    """Every pid between this process and init, for self-recognition.
+    """Every pid between this process and init.
 
-    Whatever is running this script shows up as some pane's foreground process;
-    without this the saved project would tell herdr to re-run the saver.
+    This script shows up as some pane's foreground process, and without
+    recognising it the saved project would tell herdr to re-run the saver.
     """
     pids = set()
     pid = os.getpid()
@@ -466,11 +437,8 @@ def pane_process(pane_id):
 def is_plugin_pane(pane, info, roots):
     """True for a pane herdr opened to host plugin UI.
 
-    The quick-action launcher and the projects browser run as herdr-managed
-    panes, and while one is open it is a pane of the space like any other — so
-    saving from the launcher would write the launcher itself into the project.
-    They give themselves away by having no shell: the pane's root process *is*
-    the plugin binary, run out of the plugin's install directory.
+    Saving from the launcher would otherwise write the launcher into the
+    project. Such panes have no shell: the root process *is* the plugin binary.
     """
     if not roots:
         return False
@@ -499,8 +467,8 @@ def is_plugin_pane(pane, info, roots):
 def pane_command(info, is_agent, ancestors):
     """The command to replay in this pane, or None for a plain shell.
 
-    A pane's login shell is identified by pid, not by name: a pane running
-    `bash -c ...` deliberately is worth keeping, an idle prompt is not.
+    The login shell is identified by pid, not name: a pane deliberately running
+    `bash -c ...` is worth keeping, an idle prompt is not.
     """
     shell_pid = info.get("shell_pid")
     for proc in info.get("foreground_processes", []):
@@ -509,10 +477,9 @@ def pane_command(info, is_agent, ancestors):
         argv = proc.get("argv") or []
         if not argv:
             continue
-        # Our own process tree, in a pane with no agent, is this script being
-        # run from a shell — nothing to record. An agent pane is different:
-        # `claude` is genuinely what that pane runs, even when it is the one
-        # calling us.
+        # Our own tree in a non-agent pane is this script, run from a shell.
+        # An agent pane is different: `claude` is what that pane genuinely runs,
+        # even when it is the one calling us.
         if proc.get("pid") in ancestors and not is_agent:
             return None
         if os.path.basename(argv[0]) in SHELLS:
@@ -526,10 +493,9 @@ def pane_command(info, is_agent, ancestors):
 def split_tree(panes):
     """Rebuild a tab's split tree from pane geometry.
 
-    herdr's layout response carries a flat `splits` list whose tree structure
-    lives only in generated ids; the rectangles say the same thing without
-    depending on that naming. Returns a leaf {'pane': p} or a node
-    {'dir', 'first', 'second'}, or None if the panes do not tile cleanly.
+    herdr's flat `splits` list encodes its tree only in generated ids; the
+    rectangles say the same thing without depending on that naming. Returns a
+    leaf {'pane'} or a node {'dir', 'first', 'second'}, None if it will not tile.
     """
     if len(panes) == 1:
         return {"pane": panes[0]}
@@ -552,11 +518,7 @@ def split_tree(panes):
 
 
 def prune_tree(node, drop):
-    """Drop panes from a split tree, collapsing the splits they leave behind.
-
-    Pruning the tree rather than the pane list keeps the surviving panes'
-    geometry intact: a split with one child left simply becomes that child.
-    """
+    """Drop panes from a split tree, collapsing the splits they leave behind."""
     if node is None:
         return None
     if "pane" in node:
@@ -573,10 +535,9 @@ def prune_tree(node, drop):
 def pane_chain(node):
     """Flatten a split tree into herdr-plus's linear pane list.
 
-    A project builds panes in order, each one splitting off the *previous*
-    pane, so the tree is reproduced exactly when every split's first side is a
-    single pane. Anything else (a stacked pair beside a third pane, say) is
-    flattened to the nearest chain and reported as approximate.
+    A project builds each pane off the *previous* one, so the tree survives only
+    when every split's first side is a single pane. Anything else flattens to
+    the nearest chain and is reported as approximate.
     """
     if "pane" in node:
         return [(node["pane"], None)], True
@@ -606,10 +567,8 @@ def tilde(path, home):
 def shell_path(path, home):
     """Quote a path for a shell command, keeping ~ expandable.
 
-    `cd '~/src'` would try to enter a directory literally named ~, so the tilde
-    has to stay outside the quotes: `cd ~/'src'`. Keeping it (rather than
-    writing the absolute path) is what lets the saved project open on another
-    machine with a different home.
+    `cd '~/src'` enters a directory literally named ~, so the tilde stays
+    outside the quotes — which is what lets the project open under another home.
     """
     short = tilde(path, home)
     if short == "~":
@@ -657,8 +616,7 @@ def resolve_space(requested):
 def tab_name(tab, panes, commands):
     """A tab needs a name; herdr only has one when the user set one.
 
-    An unnamed tab reports its display number as the label, which says nothing
-    in a template, so fall back to what the tab actually contains.
+    An unnamed tab reports its display number, so fall back to its contents.
     """
     label = (tab.get("label") or "").strip()
     if label and not label.isdigit():
@@ -699,8 +657,7 @@ def capture(space, args):
                      if is_plugin_pane(p, processes[p["pane_id"]], roots)}
         keep = [p for p in panes if p["pane_id"] not in transient]
         if not keep:
-            # Nothing here but plugin UI — a picker in a tab of its own is not
-            # something a template should rebuild.
+            # Nothing but plugin UI; not something a template should rebuild.
             continue
 
         layout = herdr("pane", "layout", "--pane", panes[0]["pane_id"]).get("layout", {})
@@ -712,8 +669,7 @@ def capture(space, args):
             chain = [(p["pane_id"], None if i == 0 else SPLIT_DOWN)
                      for i, p in enumerate(keep)]
         else:
-            # The tree is built from every pane, including the transient ones,
-            # so the geometry still tiles; they are pruned out afterwards.
+            # Built from every pane so the geometry still tiles, then pruned.
             tree = prune_tree(split_tree(placed), transient)
             if tree is None:
                 warn("tab %s: could not read the split layout; stacking panes" % tab["tab_id"])
@@ -762,10 +718,8 @@ def capture(space, args):
 
     working_dir = args.working_dir or captured[0]["panes"][0]["cwd"] or home
 
-    # A project has one working_dir; herdr-plus has no per-pane cwd. Panes that
-    # sit somewhere else get a `cd` in front of their command, which works
-    # because herdr-plus types the command into the pane's shell — a bare `cd`
-    # leaves an interactive shell in the right place.
+    # herdr-plus has no per-pane cwd, only one working_dir. It types a pane's
+    # command into that pane's shell, so a `cd` prefix stands in for one.
     if not args.no_cd:
         for tab in captured:
             for entry in tab["panes"]:
@@ -803,13 +757,13 @@ def render(project):
         panes = tab["panes"]
         lines += ["", "[[tabs]]", "name = %s" % toml_string(tab["name"])]
 
-        # One pane is the single-command shorthand; a split tab must use
-        # [[tabs.panes]], and setting both is a load-time error in herdr-plus.
+        # Setting both the shorthand and [[tabs.panes]] is a load-time error
+        # in herdr-plus.
         if len(panes) == 1:
             pane = panes[0]
             if pane["label"]:
-                # A labeled pane needs a pane table even when it is alone: a
-                # tab has no label field of its own.
+                # A tab has no label field, so a labelled lone pane still needs
+                # its own table.
                 lines += ["", "[[tabs.panes]]", "label = %s" % toml_string(pane["label"])]
                 if pane["command"]:
                     lines.append("command = %s" % toml_string(pane["command"]))
@@ -834,10 +788,8 @@ def render(project):
 
 
 def check(text, path):
-    """Parse what we just produced, so a bad file never reaches the browser.
-
-    herdr-plus fails the *whole* projects load on one malformed file, which
-    would take the user's other projects down with it.
+    """Parse what we just produced: herdr-plus fails the *whole* projects load
+    on one malformed file, taking the user's other projects down with it.
     """
     try:
         import tomllib
@@ -871,10 +823,8 @@ def cmd_save(args):
             die("%s already exists (use --force to overwrite)" % path)
     else:
         directory = projects_dir(args.projects_dir)
-        # herdr-plus identifies a project by its name — two files claiming one
-        # name give you two identical-looking rows in the browser and make
-        # `herdr-plus open <name>` a coin toss. So the name, not the file name,
-        # is what has to be unique.
+        # herdr-plus identifies a project by name, so the name is what has to
+        # be unique — two files claiming one make `open <name>` a coin toss.
         clashes = [p for p in load_projects(directory)
                    if (p[1] or "").lower() == project["name"].strip().lower()]
         if clashes and not args.force:
@@ -932,8 +882,7 @@ def cmd_delete(args):
             return
         matches = [chosen]
     else:
-        # An empty name prefix-matches everything, and with a single saved
-        # project that would silently delete it. A blank form is not a delete.
+        # An empty name prefix-matches everything.
         if not args.name.strip():
             die("name a project to delete (saved: %s)" % describe(projects))
 
@@ -960,10 +909,8 @@ def cmd_delete(args):
 def git(repo, *args):
     """Run git in `repo`. Returns (returncode, stdout, stderr), never dies.
 
-    Callers here care about the difference between "no" and "broken" often
-    enough that raising on non-zero would cost more than it saves — a branch
-    that is not merged and a repository that is not there both come back as a
-    non-zero exit, and only one of them is worth stopping for.
+    An unmerged branch and a missing repository both exit non-zero here, and
+    only one is worth stopping for, so callers judge rather than this.
     """
     try:
         proc = subprocess.run(
@@ -987,9 +934,8 @@ def repo_root(path):
 def hook_for(repo, name):
     """The hook script this repo would actually run, or None.
 
-    core.hooksPath may be absent, relative or absolute, and a relative one is
-    resolved against the working tree — which is why a worktree gets its own
-    copy rather than the primary's.
+    A relative core.hooksPath resolves against the working tree, so a worktree
+    runs its own copy of the hooks rather than the primary checkout's.
     """
     code, configured, _ = git(repo, "config", "--get", "core.hooksPath")
     hooks_dir = configured if code == 0 and configured else ".git/hooks"
@@ -1004,9 +950,7 @@ def hook_for(repo, name):
 def convention_evidence(repo):
     """What a caller needs to pick a branch name this repo will accept.
 
-    Evidence, not rules. Nothing here encodes an opinion about naming — the
-    repo's own history and its own hooks are the authority, and a repo with
-    neither has no convention to violate.
+    Evidence, not rules: the repo's own history and hooks are the authority.
     """
     _, subjects, _ = git(repo, "log", "--format=%s", "-n", "15")
     _, branches, _ = git(
@@ -1094,15 +1038,10 @@ def live_agent_names():
 def start_agent(alias, kind, pane_id, timeout_ms):
     """Start the agent, waiting out a pane that is not a shell prompt yet.
 
-    A pane herdr has just built is not immediately somewhere an agent can be
-    started in: the shell has to reach its prompt first, and until it does
-    `agent start` refuses with agent_pane_busy. Its own --timeout does not cover
-    this — that waits for the *agent* to become ready once it has been launched,
-    which is a later problem than getting to launch it at all.
-
-    So the wait is here, and it is a retry of the real call rather than a poll of
-    something adjacent: herdr already knows what "an available shell" means, and
-    a readiness test written here would be a second opinion that can disagree.
+    `agent start` refuses with agent_pane_busy until the new pane's shell
+    reaches its prompt. Its own --timeout does not cover that: it waits for the
+    agent to become ready once launched. Retrying the real call rather than
+    polling something adjacent keeps herdr the only judge of "available shell".
     """
     deadline = time.monotonic() + max(timeout_ms, 1000) / 1000.0
     while True:
@@ -1119,14 +1058,12 @@ def start_agent(alias, kind, pane_id, timeout_ms):
 def probe_branch(checkout, branch):
     """Ask the repo's own pre-commit whether it will accept this branch name.
 
-    Nothing is committed and nothing is staged: the hook is run for its opinion.
-    Ours answers on the branch name alone, which is the case worth catching
-    early — `worktree create` makes no commit, so without this the refusal lands
-    at the agent's first commit, deep into its session and awkward to unwind.
+    Nothing is staged or committed; the hook is run for its opinion.
+    `worktree create` makes no commit, so without this a refusal lands at the
+    agent's first commit, deep into its session.
 
-    A hook that lints or runs tests may fail here for reasons that have nothing
-    to do with the name, so this is advisory: the output goes back verbatim and
-    the caller decides whether renaming is the answer. --no-probe skips it.
+    Advisory: a hook that lints or tests may fail for unrelated reasons, so the
+    output goes back verbatim and the caller decides. --no-probe skips it.
     """
     hook = hook_for(checkout, "pre-commit")
     if hook is None:
@@ -1144,32 +1081,16 @@ def probe_branch(checkout, branch):
     return proc.returncode == 0, output
 
 
-def workspace_for_repo(repo):
-    """An existing workspace whose panes sit in `repo`, or None.
-
-    workspace list does not report a working directory — only panes do — so the
-    mapping is built from the pane side.
-    """
-    prefix = os.path.realpath(repo) + os.sep
-    for pane in herdr("pane", "list").get("panes", []):
-        cwd = pane.get("cwd") or ""
-        if cwd and (os.path.realpath(cwd) + os.sep).startswith(prefix):
-            return pane.get("workspace_id")
-    return None
-
-
 def teardown(workspace_id, repo, branch, checkout):
     """Undo a dispatch that failed after it had already built something.
 
-    Best effort and deliberately quiet about its own failures: this runs while
-    reporting a different error, and a teardown problem must not replace the
-    message explaining what actually went wrong.
+    Quiet about its own failures: it runs while a different error is being
+    reported, and must not replace the message explaining what went wrong.
     """
     if workspace_id:
         herdr_quiet("worktree", "remove", "--workspace", workspace_id)
-        # Removing the worktree does not always take the workspace with it, and
-        # a workspace left pointing at a deleted checkout is worse than the one
-        # we were rolling back — it shows in the sidebar and cannot be reopened.
+        # Removing the worktree does not always take the workspace with it,
+        # and one left pointing at a deleted checkout cannot be reopened.
         herdr_quiet("workspace", "close", workspace_id)
     if checkout and os.path.isdir(checkout):
         git(repo, "worktree", "remove", "--force", checkout)
@@ -1181,10 +1102,8 @@ def teardown(workspace_id, repo, branch, checkout):
 def herdr_quiet(*args):
     """herdr(), for calls whose failure is not worth dying over.
 
-    Returns (result, error). The error half exists because herdr reports
-    failures in the JSON body — a call that fails and a call that succeeds with
-    nothing to say both leave an empty result, and telling the caller only that
-    it "returned nothing" throws away the sentence explaining why.
+    Returns (result, error). A failure and a success with nothing to say both
+    leave an empty result, so the error half carries herdr's own sentence.
     """
     try:
         proc = subprocess.run(
@@ -1192,8 +1111,8 @@ def herdr_quiet(*args):
     except OSError as exc:
         return {}, str(exc)
 
-    # herdr answers on stdout when it succeeds and on stderr when it does not,
-    # and both are JSON, so the body is worth parsing wherever it arrives.
+    # herdr answers on stdout when it succeeds and stderr when it does not,
+    # both as JSON, so the body is worth parsing wherever it arrives.
     for stream in (proc.stdout, proc.stderr):
         text = stream.decode("utf-8", "replace").strip()
         if not text:
@@ -1216,9 +1135,8 @@ def herdr_quiet(*args):
 def fail(args, stage, message, detail=""):
     """Report a dispatch failure in a form a caller can act on.
 
-    The orchestrator picking branch names is the audience for `stage` and
-    `detail`: a refusal at the probe stage carries the hook's own words, which
-    for a decent hook names the convention it wants.
+    `stage` and `detail` are for the orchestrator picking branch names: a probe
+    refusal carries the hook's own words, which usually name the convention.
     """
     if args.json:
         print(json.dumps({
@@ -1236,15 +1154,11 @@ def fail(args, stage, message, detail=""):
 def task_document(args, repo, checkout, branch, workspace_id, pane_id):
     """The task, plus the facts about where it is being carried out.
 
-    An agent dropped into a fresh worktree has no way to know it is in one. It
-    sees a checkout that looks like the repository and reasons about it as if it
-    were — which is how a task written by somebody sitting in the primary
-    checkout ends up asking for something only the primary checkout can do. The
-    difference is not a matter of opinion, so it is stated rather than left to
-    be discovered.
+    An agent dropped into a fresh worktree cannot tell it is in one, and reasons
+    about it as the repository — which is how a task written in the primary
+    checkout ends up asking for something only that checkout can do.
 
-    Deliberately facts, not instructions. This says what is true of the place;
-    what to do about it belongs in the task, which is somebody else's to write.
+    Facts, not instructions: what to do about them belongs in the task.
     """
     if args.no_context:
         return args.task.rstrip("\n") + "\n"
@@ -1331,9 +1245,8 @@ def cmd_dispatch(args):
     prompt = args.prompt or (
         "Read %s in the repository root and start on it." % args.task_file)
 
-    # Deliberately not torn down past this point. The agent is up and the task
-    # file is written, so a prompt that fails to land is something to retry by
-    # hand — throwing the worktree away would take the agent's session with it.
+    # No teardown past this point: the agent is up, and throwing the worktree
+    # away would take its session with it. A failed prompt is retried by hand.
     submitted, prompt_err = herdr_quiet(
         "agent", "prompt", alias, prompt, "--wait",
         "--until", "working", "--timeout", str(args.prompt_timeout))
@@ -1358,9 +1271,8 @@ def cmd_dispatch(args):
         print("dispatched %s to %s (%s)" % (branch, alias, args.kind))
         print("  checkout   %s" % checkout)
         print("  workspace  %s   pane %s" % (workspace_id, pane_id))
-        # The name is the convenient handle and the pane is the durable one: a
-        # herdr restart keeps the pane and its process but forgets the alias,
-        # and `agent prompt <name>` then answers agent_not_found.
+        # A herdr restart keeps the pane and its process but forgets the
+        # alias, after which `agent prompt <name>` answers agent_not_found.
         print("  reach it   herdr agent prompt %s ...   (or %s, which survives "
               "a herdr restart)" % (alias, pane_id))
         print("  task       %s" % task_path)
@@ -1408,9 +1320,8 @@ LANDED_ELSEWHERE = (
 def is_dirty(path, task_file):
     """Uncommitted work, ignoring the task file dispatch wrote.
 
-    Without this every dispatched worktree is dirty forever: `dispatch` writes
-    the task into the checkout and nothing ever commits it, so the one signal
-    that should mean "somebody is mid-edit here" would fire on all of them.
+    Nothing ever commits that file, so without this every dispatched worktree
+    looks mid-edit forever.
     """
     code, out, _ = git(path, "status", "--porcelain")
     if code != 0:
@@ -1426,13 +1337,9 @@ def is_dirty(path, task_file):
 def landed_on_another_remote_branch(repo, branch):
     """Whether this branch's commits turned up on some *other* remote branch.
 
-    Pushing is not landing. `--contains` finds the branch's own upstream first
-    of all, so an unqualified reading of it calls a branch finished the moment
-    it is pushed — which is the moment the work starts being reviewed, with an
-    agent still sitting in the worktree waiting to answer. Its own remote ref is
-    the one piece of evidence that proves nothing, so it is excluded: by the
-    configured upstream where there is one, and by name for a branch pushed
-    without tracking.
+    Pushing is not landing, and `--contains` finds the branch's own upstream
+    first of all — so that ref is excluded, by configured upstream where there
+    is one and by name for a branch pushed without tracking.
     """
     code, remotes, _ = git(repo, "branch", "--remotes", "--contains", branch)
     if code != 0 or not remotes:
@@ -1453,12 +1360,7 @@ def landed_on_another_remote_branch(repo, branch):
 
 
 def reap_reason(repo, path, branch, base, workspaces, task_file):
-    """Why this worktree is or is not finished with, as (removable, reason).
-
-    The bar for removing is deliberately higher than the bar for keeping. A
-    worktree kept one day too long costs a directory; one removed a moment too
-    early costs whatever was in it.
-    """
+    """Why this worktree is or is not finished with, as (removable, reason)."""
     if not branch:
         return False, "detached HEAD — nothing to judge it by"
     if branch == base:
@@ -1473,10 +1375,8 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
     if dirty:
         return False, "has uncommitted changes"
 
-    # A branch with nothing of its own is not finished work, it is work that has
-    # not started. It also looks "merged" to every test below, since a branch at
-    # the base commit is trivially an ancestor of it — so an agent still reading
-    # its task would be reaped as done. Ask first.
+    # A branch at the base commit is trivially an ancestor of it, so every test
+    # below would call an agent still reading its task "merged". Ask first.
     code, ahead, _ = git(repo, "rev-list", "--count", "%s..%s" % (base, branch))
     if code == 0 and ahead.strip() == "0":
         return False, "no commits of its own yet"
@@ -1488,10 +1388,8 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
 
     state = workspaces.get(os.path.realpath(path))
     if state in ("working", "blocked"):
-        # blocked is an agent waiting on somebody, which is a conversation in
-        # progress rather than a finished one. idle is not: an agent that has
-        # finished its turn in a worktree whose work has landed is exactly what
-        # this is here to clear up.
+        # blocked is an agent waiting on somebody — a conversation in
+        # progress. idle is not, and is exactly what this clears up.
         return False, "an agent is %s in it" % state
 
     code, _, _ = git(repo, "merge-base", "--is-ancestor", branch, base)
@@ -1570,29 +1468,24 @@ def cmd_reap(args):
         if os.path.isdir(path):
             code, _, err = git(repo, "worktree", "remove", path)
             if code != 0:
-                # git refuses to remove a worktree holding anything untracked,
-                # and every dispatched worktree holds the task file dispatch
-                # wrote there. reap_reason already decided nothing else is
-                # uncommitted, so forcing removes only that file — but the
-                # check is repeated here rather than assumed, because the
-                # decision was made before anything below started running.
+                # git refuses a worktree holding anything untracked, and every
+                # dispatched one holds the task file. Re-check rather than trust
+                # reap_reason, whose decision predates everything above.
                 if is_dirty(path, task_file) is False:
                     code, _, err = git(repo, "worktree", "remove", "--force", path)
                 if code != 0:
                     warn("kept %s: %s" % (path, err.splitlines()[0] if err else "refused"))
                     continue
         git(repo, "worktree", "prune")
-        # -d, never -D by default: git refuses a branch whose commits would be
-        # lost, which is the one judgement here worth deferring to git for.
+        # -d, never -D by default: whether commits would be lost is the one
+        # judgement worth deferring to git for.
         code, _, err = git(repo, "branch", "-d", branch)
         if code == 0:
             continue
 
-        # A squash merge leaves the branch's own commits nowhere in the base, so
-        # git calls it unmerged however thoroughly the work landed. That is the
-        # normal case in a repo that squashes, and it is why --delete-branch
-        # exists — but only where something other than the base branch says the
-        # work arrived, never on the "merged into base" reading alone.
+        # A squash merge leaves the branch's commits nowhere in the base, so
+        # git calls it unmerged however thoroughly the work landed. Hence
+        # --delete-branch — but never on the "merged into base" reading alone.
         landed = reason in LANDED_ELSEWHERE
         if args.delete_branch and landed:
             code, _, err = git(repo, "branch", "-D", branch)
@@ -1612,7 +1505,7 @@ def cmd_reap(args):
 def main():
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="Save, list, and delete herdr-plus project templates.",
+        description="Save herdr-plus projects, and dispatch agents into worktrees.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1736,7 +1629,7 @@ def main():
 
     global NOTIFY, FAIL_TITLE
     NOTIFY = args.notify
-    FAIL_TITLE = "Herdr Plus: %s failed" % args.command
+    FAIL_TITLE = "Herdr Bellwethr: %s failed" % args.command
 
     args.func(args)
 

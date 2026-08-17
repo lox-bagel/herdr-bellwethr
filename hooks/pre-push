@@ -2,46 +2,16 @@
 #
 # pre-push — refuse to create an off-convention branch on the remote.
 #
-# git feeds one line per ref being pushed on stdin:
+# git feeds one line per ref on stdin:
 #
 #   <local ref> <local sha> <remote ref> <remote sha>
 #
-# The remote ref is the one that matters, not the current branch: it is the name
-# the pull request will carry, so it is the name the convention applies to.
-# `git push origin feat/x:whatever` puts `whatever` on the remote no matter what
-# the local branch is called, and a check on the current branch would see a
-# well-named one and pass.
+# The remote ref is what matters, not the current branch: `git push origin
+# feat/x:whatever` puts `whatever` on the remote, and that is the name the pull
+# request carries.
 #
-# Deliberate exceptions:
-#
-#   BELLWETHR_SKIP_CHECKS=1 git push ...   say it once, for this push
-#   git push --no-verify ...               skip every hook, this one included
-#
-# Same caveat as pre-commit: local guard, not protection. It is off in a clone
-# that has not set core.hooksPath. That is precisely why the main guard is no
-# longer here and this check still is.
-#
-# main is now the remote's business. The repository is public, so the ruleset
-# this hook's header used to carry as a recipe exists — "main: pull request
-# only", enforced by GitHub for every clone, every machine and anyone who ends
-# up with push rights, none of which a hook on one laptop could claim:
-#
-#   deletion              main cannot be deleted
-#   non_fast_forward      main cannot be force-pushed
-#   pull_request          main takes commits only through a PR, 0 approvals
-#   required_status_checks   the pr-title check must pass first
-#
-#   gh api repos/<owner>/<repo>/rulesets              list them
-#   gh api repos/<owner>/<repo>/rulesets/<id>         read this one back
-#
-# Zero approvals is deliberate: it still requires a pull request to exist, and
-# GitHub does not let you approve your own, so any higher number would leave a
-# solo maintainer unable to merge. Raise it when there is somebody to ask. The
-# required check is what finally gave the pr-title workflow teeth — before the
-# ruleset it reported and nothing acted on the report.
-#
-# The branch-name check below is what is left of this hook, and it stays. The
-# ruleset covers main; naming is not something it can be asked to do here.
+# main is not checked here. The "main: pull request only" ruleset does it on the
+# remote, for every clone — `gh api repos/<owner>/<repo>/rulesets` reads it back.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -54,7 +24,6 @@ status=0
 while read -r local_ref local_sha remote_ref remote_sha; do
 	[ -n "$remote_ref" ] || continue
 
-	# Tags and other non-branch refs are not what this convention is about.
 	case "$remote_ref" in
 	refs/heads/*) ;;
 	*) continue ;;

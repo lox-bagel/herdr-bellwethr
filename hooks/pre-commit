@@ -2,30 +2,10 @@
 #
 # pre-commit — refuse to commit on a branch named off-convention.
 #
-# The branch name is checked here rather than at push time because a name is
-# cheap to change before there are commits on it and awkward after — `git branch
-# -m` is fine locally, but once the branch is pushed and has a pull request the
-# rename has to happen on the remote to keep the PR attached to it.
+# The name is checked at commit time, not push time: once a branch is pushed and
+# has a pull request, renaming it has to happen on the remote or the PR closes.
 #
-# main is no longer refused here. The repository is public, so a ruleset can
-# finally do that job on the remote — see the header of hooks/pre-push — and it
-# does it for every clone and every machine rather than for whoever happens to
-# have core.hooksPath set. A commit made on main by mistake now simply has
-# nowhere to go, which is the same outcome reached later and more honestly.
-# Moving one is still not hard:
-#
-#   git branch feat/some-thing && git reset --hard origin/main
-#
-# Deliberate exceptions, in the order you should reach for them:
-#
-#   BELLWETHR_SKIP_CHECKS=1 git commit ...   say it once, for this commit
-#   git commit --no-verify ...               skip every hook, this one included
-#
-# This is a local guard, not protection. It lives on this machine only, it is
-# off in a clone that has not set core.hooksPath, and --no-verify walks past it.
-# That is exactly why the main guard moved to the remote the moment it could.
-# Branch naming — and commit format, in hooks/commit-msg — have no ruleset
-# equivalent, so they stay here and keep that caveat.
+# main is the ruleset's job now, not this hook's — see hooks/pre-push.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -33,8 +13,8 @@ fi
 
 . "$(dirname "$0")/common.sh"
 
-# A detached HEAD has no branch name to hold to a convention — rebases and
-# bisects run here, and complaining about them would break more than it helps.
+# Detached HEAD has no branch name to hold to a convention, and rebases and
+# bisects run there.
 branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
 
 bellwethr_check_branch "$branch" "pre-commit" || exit 1

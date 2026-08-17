@@ -2,15 +2,8 @@
 #
 #   herdr plugin link ~/ws/herdr-bellwethr
 #
-# Only the delete picker needs to be a plugin. Saving is a one-shot command that
-# a keybind or a quick action can run directly, but picking *which* project to
-# delete needs a terminal to draw a fuzzy list in — and herdr only hands a pane
-# to a registered plugin. herdr opens the pane, runs the picker in it, and tears
-# it down when the picker exits, restoring the previous focus. That is the same
-# machinery the quick-action launcher itself uses.
-#
-# Windows is out of scope here, as it is everywhere else in this repo — herdr's
-# Windows build is preview-beta.
+# Only the delete picker needs to be a plugin: herdr hands a pane to draw a
+# fuzzy list in only to a registered plugin. Everything else is a plain command.
 
 id = "herdr-bellwethr"
 name = "Herdr Bellwethr"
@@ -19,22 +12,17 @@ min_herdr_version = "0.7.0"
 description = "Save the current herdr space as a herdr-plus project, and delete saved ones from a fuzzy picker."
 platforms = ["linux", "macos"]
 
-# The action herdr (or a quick action, or a keybind) invokes. It has no terminal
-# of its own — herdr runs it server-side — so all it does is ask herdr for the
-# picker pane below. HERDR_BIN_PATH points at the running herdr binary and is
-# the portable way back into the CLI from a plugin command.
+# Runs server-side with no terminal, so all it can do is ask herdr for the
+# picker pane below. HERDR_BIN_PATH is the portable way back into the CLI.
 [[actions]]
 id = "delete"
 title = "Bellwethr: delete a project"
 platforms = ["linux", "macos"]
 command = ["/bin/sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin herdr-bellwethr --entrypoint delete-picker --placement overlay"]
 
-# The picker itself, as a herdr-managed overlay pane. The command is relative
-# because herdr runs a pane's command with the plugin root as its working
-# directory — the same reason herdr-plus registers ./bin/herdr-plus.
-#
-# --notify because this pane disappears the moment the picker exits: whatever it
-# printed goes with it, so the outcome has to arrive as a herdr notification.
+# The command is relative because herdr runs a pane's command with the plugin
+# root as its working directory. --notify because the pane disappears the moment
+# the picker exits, taking whatever it printed with it.
 [[panes]]
 id = "delete-picker"
 title = "Delete project"

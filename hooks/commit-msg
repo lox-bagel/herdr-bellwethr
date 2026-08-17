@@ -3,34 +3,6 @@
 # commit-msg — hold commit messages to Conventional Commits.
 #
 #   <type>[(scope)][!]: <subject>
-#
-#   feat(hooks): refuse a branch name that is not <type>/<slug>
-#   fix(dev-link): back up a plain file before replacing it
-#   chore!: rename herdr-project to herdr-bellwethr
-#
-# The prefix is the machine-readable half: it is what a changelog generator and
-# a semver bump read, and `!` (or a `BREAKING CHANGE:` footer) is the only part
-# of a commit message that can mean a major version on its own.
-#
-# The body is the half people read, and this hook deliberately does not require
-# one — a rule that forces a paragraph produces paragraphs that say nothing. The
-# repo's own commits explain why a change was made rather than restating what
-# the diff already shows; that is a habit, not something a regex can check.
-#
-# Left alone on purpose:
-#
-#   Merge ...        git writes these, and the format is git's to choose
-#   Revert "..."     likewise, and the quoted subject already carries a type
-#   fixup!/squash!   placeholders that disappear at `rebase --autosquash`
-#
-# Deliberate exception:
-#
-#   BELLWETHR_SKIP_CHECKS=1 git commit ...   this commit only
-#   git commit --no-verify ...               skip every hook
-#
-# Local guard, same as the others. GitHub has no ruleset for commit format, so
-# unlike the main check this one has no server-side replacement to graduate to —
-# it stays after the repo goes public.
 
 if [ -n "$BELLWETHR_SKIP_CHECKS" ]; then
 	exit 0
@@ -40,18 +12,18 @@ fi
 
 msg_file="$1"
 
-# Everything git will strip before storing: comment lines, and the diff below
-# the scissors line that `commit --verbose` appends. Checking the raw file would
-# read the diff as a body.
+# Strip what git strips before storing: comment lines, and the diff below the
+# scissors line `commit --verbose` appends. The raw file would read as a body.
 clean=$(sed -e '/^# -\{1,\} >8 -\{1,\}$/,$d' -e '/^#/d' "$msg_file")
 
 subject=$(printf '%s\n' "$clean" | awk 'NF {print; exit}')
 
 if [ -z "$subject" ]; then
-	# An empty message aborts the commit on its own; saying so twice helps nobody.
+	# An empty message aborts the commit on its own.
 	exit 0
 fi
 
+# git writes these itself, and fixup!/squash! disappear at --autosquash.
 case "$subject" in
 "Merge "* | "Revert "* | "fixup!"* | "squash!"*) exit 0 ;;
 esac
@@ -76,8 +48,7 @@ fi
 
 description=${subject#*: }
 
-# 72 is where git log stops being readable in an 80-column terminal once it has
-# added its four-space indent.
+# 72 is where git log stops fitting an 80-column terminal, given its indent.
 if [ "${#subject}" -gt 72 ]; then
 	fail "subject is ${#subject} characters; the limit is 72."
 fi
@@ -87,8 +58,8 @@ case "$description" in
 *.) fail "description ends with a period; drop it." ;;
 esac
 
-# A body has to be separated from the subject, or git treats the whole run of
-# lines as one paragraph and every tool that shows a subject shows all of it.
+# Without a blank line git reads subject and body as one paragraph, and every
+# tool that shows a subject shows all of it.
 subject_line=$(printf '%s\n' "$clean" | awk 'NF {print NR; exit}')
 next_line=$(printf '%s\n' "$clean" | sed -n "$((subject_line + 1))p")
 
