@@ -40,7 +40,7 @@ plus every plugin `config/plugins.list` recommends.
 | --- | --- | --- |
 | **herdr** | all of it — this is a herdr plugin and a caller of its CLI | nothing here runs |
 | **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
-| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
+| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated; `reap`, which reads pull request state through `gh` | that one tab, which says so; the rest of reviewr is fine. `reap` falls back on what git can see, so a rebase-merged or closed branch looks unfinished |
 | **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
 | **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
 | **truecolor + Unicode box-drawing** | reviewr's TUI | a readable diff |

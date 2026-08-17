@@ -1368,11 +1368,15 @@ def worktree_entries(repo):
     return out
 
 
-# Reasons that mean the work reached somewhere other than the base branch, so
-# a `git branch -d` refusal is git being literal rather than git being right.
-LANDED_ELSEWHERE = (
+# Reasons that leave the branch's commits somewhere other than this checkout —
+# on another remote branch, or on the branch's own remote branch behind a pull
+# request. Deleting the local branch loses nothing in either case, so a
+# `git branch -d` refusal is git being literal rather than git being right.
+# Matched as prefixes: a pull request reason carries its number.
+RECOVERABLE = (
     "its upstream branch is gone",
     "its commits are on another remote branch",
+    "its pull request ",
 )
 
 
@@ -1418,6 +1422,47 @@ def landed_on_another_remote_branch(repo, branch):
     return False
 
 
+def gh_json(repo, *args):
+    """Run gh in `repo` and return its parsed JSON, or None.
+
+    gh missing, gh not logged in, no GitHub remote, no network: all of them
+    read the same here, as no answer. The caller falls back on what git can
+    see rather than deciding anything on the strength of an absent CLI.
+    """
+    try:
+        proc = subprocess.run(
+            ("gh",) + args, cwd=repo,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace") or "null")
+    except ValueError:
+        return None
+
+
+def pull_request_state(repo, branch):
+    """The pull request that decides this branch, as (state, number) or None.
+
+    A branch can carry several — one closed and a later one open, say. An open
+    one outranks everything, being a conversation still going whatever else the
+    branch has been through; after that the newest merged one, then the newest
+    closed one.
+    """
+    pulls = gh_json(repo, "pr", "list", "--head", branch, "--state", "all",
+                    "--limit", "20", "--json", "number,state")
+    if not pulls:
+        return None
+    for state in ("OPEN", "MERGED", "CLOSED"):
+        matching = [p for p in pulls if p.get("state") == state]
+        if matching:
+            return state, max(p.get("number") or 0 for p in matching)
+    return None
+
+
 def reap_reason(repo, path, branch, base, workspaces, task_file):
     """Why this worktree is or is not finished with, as (removable, reason)."""
     if not branch:
@@ -1454,6 +1499,19 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
     code, _, _ = git(repo, "merge-base", "--is-ancestor", branch, base)
     if code == 0:
         return True, "merged into %s" % base
+
+    # The pull request, not the commits, is what says the work is finished
+    # with. A rebase or squash merge rewrites the commits, so git sees nothing
+    # of them in the base; a pull request closed unmerged is a decision that
+    # the work is not wanted, which git cannot see at all.
+    pull_request = pull_request_state(repo, branch)
+    if pull_request:
+        state, number = pull_request
+        if state == "MERGED":
+            return True, "its pull request #%s was merged" % number
+        if state == "CLOSED":
+            return True, "its pull request #%s was closed without merging" % number
+        return False, "its pull request #%s is still open" % number
 
     if landed_on_another_remote_branch(repo, branch):
         return True, "its commits are on another remote branch"
@@ -1542,11 +1600,16 @@ def cmd_reap(args):
         if code == 0:
             continue
 
-        # A squash merge leaves the branch's commits nowhere in the base, so
-        # git calls it unmerged however thoroughly the work landed. Hence
-        # --delete-branch — but never on the "merged into base" reading alone.
-        landed = reason in LANDED_ELSEWHERE
-        if args.delete_branch and landed:
+        # A rebase or squash merge leaves the branch's commits nowhere in the
+        # base, so git calls it unmerged however thoroughly the work landed —
+        # and a closed pull request never landed at all, though its commits are
+        # still on the remote. Hence --delete-branch, and only for those: never
+        # on the "merged into base" reading alone.
+        #
+        # Local only. The remote branch stays, so a closed pull request can be
+        # reopened, or the branch checked out again and a new one raised.
+        recoverable = reason.startswith(RECOVERABLE)
+        if args.delete_branch and recoverable:
             code, _, err = git(repo, "branch", "-D", branch)
             if code == 0:
                 print("  deleted branch %s (%s)" % (branch, reason))
@@ -1555,7 +1618,7 @@ def cmd_reap(args):
         warn("kept branch %s: %s%s" % (
             branch,
             err.splitlines()[0] if err else "refused",
-            "" if args.delete_branch or not landed
+            "" if args.delete_branch or not recoverable
             else " — pass --delete-branch to remove it anyway"))
 
 
@@ -1669,17 +1732,21 @@ def main():
 
     reap = subparsers.add_parser(
         "reap", help="report worktrees that look finished with",
-        description="Find dispatched worktrees whose work has landed.",
-        epilog="Reports and removes nothing until --remove. A worktree kept a day too "
-               "long costs a directory; one removed a moment too early costs whatever "
-               "was in it, so anything uncertain is kept and said out loud.")
+        description="Find dispatched worktrees whose work has landed, or been "
+                    "turned down. Reads pull request state through `gh` where "
+                    "there is one to read.",
+        epilog="Reports and removes nothing until --remove, and never deletes a "
+               "remote branch. A worktree kept a day too long costs a directory; one "
+               "removed a moment too early costs whatever was in it, so anything "
+               "uncertain is kept and said out loud.")
     reap.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
     reap.add_argument("--base", metavar="REF", default="main",
                       help="branch work merges into (default: main)")
     reap.add_argument("--remove", action="store_true", help="actually remove them")
     reap.add_argument("--delete-branch", action="store_true",
-                      help="also delete a branch git calls unmerged, when the work "
-                           "landed somewhere other than the base (squash merges)")
+                      help="also delete the local branch where git calls it "
+                           "unmerged but nothing is lost: a rebase or squash merge, "
+                           "or a pull request closed unmerged. Never the remote one")
     reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
                       help="task file dispatch writes, ignored when judging a "
                            "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)
