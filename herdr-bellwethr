@@ -11,10 +11,12 @@
 #   herdr-bellwethr conventions              how this repo names branches
 #   herdr-bellwethr dispatch "<task>" --branch feat/x    hand it to an agent
 #   herdr-bellwethr reap                     worktrees that look finished with
+#   herdr-bellwethr sessions                 what is inside each herdr session
 #
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
-# lags the running session.
+# lags the running session. A *stopped* session is the exception: no server left
+# to lag behind, and see the sessions section.
 
 """Save herdr-plus projects, and dispatch agents into worktrees."""
 
@@ -244,24 +246,25 @@ def fuzzy_score(text, query):
     return (start, gaps, len(text))
 
 
-def fuzzy_filter(projects, query):
-    # No query, no ranking: keep the alphabetical order the list already has.
+def fuzzy_filter(rows, query):
+    # No query, no ranking: keep the order the list already has.
     if not query:
-        return list(projects)
+        return list(rows)
 
     ranked = []
-    for project in projects:
-        label = project[1] or os.path.basename(project[0])
+    for row in rows:
+        label, detail = row[0], row[1]
         score = fuzzy_score(label, query)
         if score is None:
-            # Findable by file name too, as `delete <name>` allows.
-            score = fuzzy_score(os.path.basename(project[0]), query)
+            # The dim half too: a project by its file name, as `delete <name>`
+            # allows, and a session by what is inside it.
+            score = fuzzy_score(detail, query)
             if score is None:
                 continue
             score = (score[0] + 100,) + score[1:]
-        ranked.append((score, project))
+        ranked.append((score, row))
     ranked.sort(key=lambda item: item[0])
-    return [project for _, project in ranked]
+    return [row for _, row in ranked]
 
 
 class Tty(object):
@@ -329,45 +332,56 @@ class Tty(object):
         return char if char.isprintable() else ""
 
 
-def pick_project(projects, title):
-    """Fuzzy-pick one project, or None if the user backed out."""
+def pick(rows, title, decide):
+    """Fuzzy-pick one row's payload, or None if the user backed out.
+
+    A row is (label, detail, payload); typing filters on the label. `decide`
+    returns (question, refusal): the question to confirm, or why this row
+    cannot be acted on at all, shown in its place.
+    """
     query = ""
     selected = 0
+    notice = ""
 
     with Tty() as tty_io:
         while True:
-            shown = fuzzy_filter(projects, query)
+            shown = fuzzy_filter(rows, query)
             if not shown:
                 selected = 0
             else:
                 selected = max(0, min(selected, len(shown) - 1))
 
-            width = max([len(p[1] or "?") for p in projects] + [4])
+            width = max([len(row[0]) for row in rows] + [4])
             lines = ["\033[2J\033[H",
                      "  \033[1m%s\033[0m\r\n\r\n" % title,
                      "  > %s\033[7m \033[0m\r\n\r\n" % query]
             if not shown:
-                lines.append("    \033[2mno project matches\033[0m\r\n")
-            for i, (path, name) in enumerate(shown):
-                label = name or "(unnamed)"
+                lines.append("    \033[2mnothing matches\033[0m\r\n")
+            for i, (label, detail, _) in enumerate(shown):
                 if i == selected:
                     lines.append("  \033[32m❯\033[0m \033[1m%-*s\033[0m  \033[2m%s\033[0m\r\n"
-                                 % (width, label, os.path.basename(path)))
+                                 % (width, label, detail))
                 else:
-                    lines.append("    %-*s  \033[2m%s\033[0m\r\n"
-                                 % (width, label, os.path.basename(path)))
+                    lines.append("    %-*s  \033[2m%s\033[0m\r\n" % (width, label, detail))
+            if notice:
+                lines.append("\r\n  \033[33m%s\033[0m\r\n" % notice)
             lines.append("\r\n  \033[2mtype to filter · ↑/↓ move · enter select · esc cancel\033[0m\r\n")
             tty_io.write("".join(lines))
 
+            notice = ""
             key = tty_io.key()
             if key == "esc":
                 return None
             if key == "enter":
                 if not shown:
                     continue
-                chosen = shown[selected]
-                if confirm(tty_io, "delete %r?" % (chosen[1] or os.path.basename(chosen[0]))):
-                    return chosen
+                payload = shown[selected][2]
+                question, refusal = decide(payload)
+                if refusal:
+                    notice = refusal
+                    continue
+                if confirm(tty_io, question):
+                    return payload
                 return None
             if key == "up":
                 selected -= 1
@@ -873,8 +887,12 @@ def cmd_delete(args):
     if args.pick or not args.name:
         if not os.path.exists("/dev/tty"):
             die("--pick needs a terminal; pass a project name instead")
+        rows = [(name or "(unnamed)", os.path.basename(path), (path, name))
+                for path, name in projects]
         try:
-            chosen = pick_project(projects, "Delete a Herdr Plus project")
+            chosen = pick(rows, "Delete a Herdr Plus project",
+                          lambda project: ("delete %r?" % (project[1]
+                                                           or os.path.basename(project[0])), ""))
         except (OSError, ImportError) as exc:
             die("could not open the picker (%s); pass a project name instead" % exc)
         if chosen is None:
@@ -1500,6 +1518,277 @@ def cmd_reap(args):
             else " — pass --delete-branch to remove it anyway"))
 
 
+# ---------------------------------------------------------------- sessions --
+#
+# A herdr session is a whole server: its own socket, spaces and processes.
+# `herdr session list` is enough to address one and not to choose between them,
+# so this says what is in each. Running sessions answer over their own socket;
+# a stopped one has only its session.json, and no server left to lag behind it.
+#
+# Not attach: herdr refuses that from inside a pane ("nested herdr is disabled
+# by default"), so no plugin can switch sessions. This prints the shell command.
+
+# The count on the summary line is always the true one.
+MAX_SPACES_SHOWN = 8
+
+# Worst first: a blocked agent is the one fact that should stop you stopping a
+# session.
+AGENT_STATE_ORDER = ("blocked", "working", "unknown", "idle", "done")
+
+
+def session_json(*args):
+    """Run `herdr session ...` and return (payload, error).
+
+    The CLI answers these itself rather than asking a server, so they carry a
+    bare object instead of the {"result": ...} envelope herdr_quiet() unwraps.
+    """
+    try:
+        proc = subprocess.run(
+            ("herdr", "session") + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        return {}, str(exc)
+
+    for stream in (proc.stdout, proc.stderr):
+        text = stream.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if "error" in payload:
+            e = payload["error"]
+            return {}, "%s (%s)" % (e.get("message", "failed"), e.get("code", "?"))
+        return payload, ""
+
+    text = proc.stderr.decode("utf-8", "replace").strip() \
+        or proc.stdout.decode("utf-8", "replace").strip()
+    return {}, text[:400] or "no output"
+
+
+def current_socket():
+    """The socket of the session this process is running in, or None.
+
+    herdr sets HERDR_SOCKET_PATH in every pane it owns, plugin panes included,
+    which is what tells the picker the one session it must not offer to stop.
+    """
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not path:
+        return None
+    return os.path.realpath(path)
+
+
+def live_spaces(name):
+    """(spaces, agents, note) for a running session, asked of its own socket.
+
+    One snapshot rather than three list calls, which would show three different
+    moments of a session still moving.
+    """
+    result, err = herdr_quiet("--session", name, "api", "snapshot")
+    if err:
+        return [], [], err
+
+    snapshot = result.get("snapshot", {})
+    cwds = {}
+    for pane in snapshot.get("panes", []):
+        cwds.setdefault(pane.get("workspace_id"), pane.get("cwd") or "")
+
+    spaces = []
+    for space in snapshot.get("workspaces", []):
+        space_id = space.get("workspace_id")
+        spaces.append({
+            "label": space.get("label") or space_id or "?",
+            "cwd": cwds.get(space_id, ""),
+            "tabs": space.get("tab_count") or 0,
+            "panes": space.get("pane_count") or 0,
+        })
+
+    agents = [{"name": agent.get("name") or "",
+               "kind": agent.get("agent") or "?",
+               "status": agent.get("agent_status") or "unknown"}
+              for agent in snapshot.get("agents", [])]
+    return spaces, agents, ""
+
+
+def saved_spaces(session_dir):
+    """(spaces, note) a stopped session would restore, from its session.json.
+
+    herdr's file, not ours, so a shape we do not recognise is reported and
+    stepped over; nothing but the reading depends on it.
+    """
+    path = os.path.join(session_dir, "session.json")
+    try:
+        with open(path, "rb") as handle:
+            saved = json.loads(handle.read().decode("utf-8", "replace"))
+    except OSError:
+        return [], "nothing saved to restore"
+    except ValueError:
+        return [], "its session.json did not parse"
+
+    if not isinstance(saved, dict) or not isinstance(saved.get("workspaces"), list):
+        return [], "its session.json is not a shape this knows"
+
+    spaces = []
+    for space in saved["workspaces"]:
+        if not isinstance(space, dict):
+            continue
+        cwd = space.get("identity_cwd") or ""
+        tabs = space.get("tabs")
+        tabs = tabs if isinstance(tabs, list) else []
+        panes = 0
+        for tab in tabs:
+            if isinstance(tab, dict) and isinstance(tab.get("panes"), dict):
+                panes += len(tab["panes"])
+        spaces.append({
+            "label": (space.get("custom_name")
+                      or os.path.basename(cwd.rstrip(os.sep))
+                      or space.get("id") or "?"),
+            "cwd": cwd,
+            "tabs": len(tabs),
+            "panes": panes,
+        })
+    return spaces, ""
+
+
+def load_sessions():
+    """Every session herdr knows about, with what is inside it."""
+    payload, err = session_json("list", "--json")
+    if err:
+        die("could not list sessions: %s" % err)
+
+    here = current_socket()
+    sessions = []
+    for entry in payload.get("sessions", []):
+        socket_path = entry.get("socket_path") or ""
+        item = {
+            "name": entry.get("name") or "?",
+            "running": bool(entry.get("running")),
+            "default": bool(entry.get("default")),
+            "session_dir": entry.get("session_dir") or "",
+            "socket_path": socket_path,
+            "current": bool(here and socket_path
+                            and os.path.realpath(socket_path) == here),
+            "agents": [],
+        }
+        if item["running"]:
+            item["spaces"], item["agents"], item["note"] = live_spaces(item["name"])
+        else:
+            item["spaces"], item["note"] = saved_spaces(item["session_dir"])
+        sessions.append(item)
+    return sessions
+
+
+def agent_summary(agents):
+    counts = {}
+    for agent in agents:
+        counts[agent["status"]] = counts.get(agent["status"], 0) + 1
+    ordered = [state for state in AGENT_STATE_ORDER if state in counts]
+    ordered += sorted(state for state in counts if state not in AGENT_STATE_ORDER)
+    return "%d agent%s (%s)" % (
+        len(agents), "" if len(agents) == 1 else "s",
+        ", ".join("%d %s" % (counts[state], state) for state in ordered))
+
+
+def session_detail(item):
+    """One line of what is in a session, or of why that is not known."""
+    spaces = item["spaces"]
+    if item["running"]:
+        if item["note"]:
+            return "running · could not read it: %s" % item["note"]
+        if not spaces:
+            return "running · nothing in it"
+        panes = sum(space["panes"] for space in spaces)
+        parts = ["running",
+                 "%d space%s" % (len(spaces), "" if len(spaces) == 1 else "s"),
+                 "%d pane%s" % (panes, "" if panes == 1 else "s")]
+        if item["agents"]:
+            parts.append(agent_summary(item["agents"]))
+        return " · ".join(parts)
+
+    if item["note"]:
+        return "stopped · %s" % item["note"]
+    return "stopped · %d space%s saved" % (len(spaces), "" if len(spaces) == 1 else "s")
+
+
+def cmd_sessions(args):
+    sessions = load_sessions()
+
+    if args.json:
+        print(json.dumps({"sessions": sessions}, indent=2, sort_keys=True))
+        return
+
+    if args.pick:
+        pick_session(sessions)
+        return
+
+    home = os.path.expanduser("~")
+    width = max([len(item["name"]) for item in sessions] + [7])
+    for item in sessions:
+        print("  %-*s  %s%s" % (width, item["name"], session_detail(item),
+                                "   ← you are here" if item["current"] else ""))
+        shown = item["spaces"][:MAX_SPACES_SHOWN]
+        label_width = max([len(space["label"]) for space in shown] + [4])
+        for space in shown:
+            print("      %-*s  %s" % (label_width, space["label"],
+                                      tilde(space["cwd"], home) or "?"))
+        if len(item["spaces"]) > len(shown):
+            print("      … and %d more" % (len(item["spaces"]) - len(shown)))
+
+    print("")
+    print("  attaching is the client's job and herdr refuses to nest, so switch")
+    print("  session from a shell outside herdr:  herdr session attach <name>")
+
+
+def session_question(item):
+    """(question, refusal) for acting on a session from the picker.
+
+    Stopping kills every process in that session, so the question says how
+    many. The session hosting the picker is refused outright.
+    """
+    if item["current"]:
+        return "", "that is the session you are in — stop it from outside, or not at all"
+
+    if item["running"]:
+        live = agent_summary(item["agents"]) if item["agents"] else "no agents"
+        return "stop %r? %s, and every process in it goes" % (item["name"], live), ""
+
+    if item["default"]:
+        # herdr recreates it on the next launch; the saved layout does not come
+        # back.
+        return ("delete the default session's saved layout (%d space%s)?"
+                % (len(item["spaces"]), "" if len(item["spaces"]) == 1 else "s")), ""
+
+    return ("delete %r and the %d space%s it would restore?"
+            % (item["name"], len(item["spaces"]),
+               "" if len(item["spaces"]) == 1 else "s")), ""
+
+
+def pick_session(sessions):
+    if not os.path.exists("/dev/tty"):
+        die("--pick needs a terminal; run `%s sessions` for the list" % PROG)
+
+    rows = [(item["name"], session_detail(item), item) for item in sessions]
+    try:
+        chosen = pick(rows, "Herdr sessions — stop a running one, delete a stopped one",
+                      session_question)
+    except (OSError, ImportError) as exc:
+        die("could not open the picker (%s); run `%s sessions` instead" % (exc, PROG))
+
+    if chosen is None:
+        print("cancelled")
+        return
+
+    # The verb the confirmation asked about, not what a second look would find.
+    verb = "stop" if chosen["running"] else "delete"
+    _, err = session_json(verb, chosen["name"], "--json")
+    if err:
+        die("could not %s %s: %s" % (verb, chosen["name"], err))
+
+    done = "stopped" if verb == "stop" else "deleted"
+    print("%s session %r" % (done, chosen["name"]))
+    notify("Herdr: session %s" % done, chosen["name"])
+
+
 # -------------------------------------------------------------------- main --
 
 def main():
@@ -1621,6 +1910,19 @@ def main():
     reap.add_argument("--json", action="store_true", help="machine-readable")
     shared(reap)
     reap.set_defaults(func=cmd_reap)
+
+    sessions = subparsers.add_parser(
+        "sessions", help="what is inside each herdr session",
+        description="List herdr's sessions and what each one holds.",
+        epilog="herdr's own `session list` names them; this says what is in them, which "
+               "is what tells you which to attach, stop or delete. Only --pick acts, and "
+               "never on the session it is running in. Attaching is not here at all: "
+               "herdr refuses to nest, so no pane can do it.")
+    sessions.add_argument("--pick", action="store_true",
+                          help="fuzzy-pick one to stop (if running) or delete (if stopped)")
+    sessions.add_argument("--json", action="store_true", help="machine-readable")
+    shared(sessions)
+    sessions.set_defaults(func=cmd_sessions)
 
     args = parser.parse_args()
     if not args.command:

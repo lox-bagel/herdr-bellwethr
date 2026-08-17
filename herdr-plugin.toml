@@ -29,3 +29,19 @@ title = "Delete project"
 placement = "overlay"
 platforms = ["linux", "macos"]
 command = ["./herdr-bellwethr", "delete", "--pick", "--notify"]
+
+# The sessions overview, a plugin pane for the same reason: it needs a terminal
+# to draw the list in. It cannot offer to attach — herdr refuses to run inside
+# its own pane — so switching sessions stays a shell command, which it prints.
+[[actions]]
+id = "sessions"
+title = "Bellwethr: sessions"
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin herdr-bellwethr --entrypoint sessions-picker --placement overlay"]
+
+[[panes]]
+id = "sessions-picker"
+title = "Herdr sessions"
+placement = "overlay"
+platforms = ["linux", "macos"]
+command = ["./herdr-bellwethr", "sessions", "--pick", "--notify"]
