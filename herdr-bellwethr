@@ -24,6 +24,7 @@ import os
 import os.path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -1309,11 +1310,13 @@ def worktree_entries(repo):
     return out
 
 
-# Reasons that mean the work reached somewhere other than the base branch, so
-# a `git branch -d` refusal is git being literal rather than git being right.
+# Reason prefixes that mean the work reached somewhere other than the base
+# branch, so a `git branch -d` refusal is git being literal rather than git
+# being right.
 LANDED_ELSEWHERE = (
     "its upstream branch is gone",
     "its commits are on another remote branch",
+    "its pull request",
 )
 
 
@@ -1359,7 +1362,37 @@ def landed_on_another_remote_branch(repo, branch):
     return False
 
 
-def reap_reason(repo, path, branch, base, workspaces, task_file):
+def merged_pull_request(repo, branch):
+    """The number of this branch's merged pull request, or None.
+
+    A squash merge puts none of the branch's commits into the base, so git can
+    only tell that the work landed once the remote branch is deleted. The forge
+    knows either way, and asking it is what makes deleting unnecessary.
+
+    `gh` is optional: with no `gh`, no GitHub remote, no authentication or no
+    network this answers None and the git-only signals decide. The timeout is
+    so that a forge which does not answer cannot hold reap up either.
+    """
+    if not shutil.which("gh"):
+        return None
+    try:
+        proc = subprocess.run(
+            ("gh", "pr", "view", branch, "--json", "number,state"),
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        pr = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return pr.get("number") if pr.get("state") == "MERGED" else None
+
+
+def reap_reason(repo, path, branch, base, workspaces, task_file, forge=True):
     """Why this worktree is or is not finished with, as (removable, reason)."""
     if not branch:
         return False, "detached HEAD — nothing to judge it by"
@@ -1399,10 +1432,19 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
     if landed_on_another_remote_branch(repo, branch):
         return True, "its commits are on another remote branch"
 
-    if upstream_gone:
-        code, tracked, _ = git(repo, "config", "--get", "branch.%s.remote" % branch)
-        if code == 0 and tracked:
-            return True, "its upstream branch is gone"
+    code, tracked, _ = git(repo, "config", "--get", "branch.%s.remote" % branch)
+    pushed = code == 0 and bool(tracked)
+
+    if upstream_gone and pushed:
+        return True, "its upstream branch is gone"
+
+    # Last, because it is the only signal that costs a network call, and every
+    # signal above settles the question locally when it fires. A branch that
+    # was never pushed has no pull request to ask about.
+    if forge and pushed:
+        number = merged_pull_request(repo, branch)
+        if number is not None:
+            return True, "its pull request #%s is merged" % number
 
     return False, "not merged into %s and not on another remote branch" % base
 
@@ -1436,7 +1478,8 @@ def cmd_reap(args):
         if here == path or here.startswith(path + os.sep):
             kept.append((path, branch, "you are in it"))
             continue
-        ok, reason = reap_reason(repo, path, branch, args.base, workspaces, args.task_file)
+        ok, reason = reap_reason(repo, path, branch, args.base, workspaces,
+                                 args.task_file, not args.no_forge)
         (removable if ok else kept).append((path, branch, reason))
 
     if args.json:
@@ -1486,7 +1529,8 @@ def cmd_reap(args):
         # A squash merge leaves the branch's commits nowhere in the base, so
         # git calls it unmerged however thoroughly the work landed. Hence
         # --delete-branch — but never on the "merged into base" reading alone.
-        landed = reason in LANDED_ELSEWHERE
+        # This is the local branch only; nothing here touches the remote.
+        landed = reason.startswith(LANDED_ELSEWHERE)
         if args.delete_branch and landed:
             code, _, err = git(repo, "branch", "-D", branch)
             if code == 0:
@@ -1605,14 +1649,21 @@ def main():
         description="Find dispatched worktrees whose work has landed.",
         epilog="Reports and removes nothing until --remove. A worktree kept a day too "
                "long costs a directory; one removed a moment too early costs whatever "
-               "was in it, so anything uncertain is kept and said out loud.")
+               "was in it, so anything uncertain is kept and said out loud. Landing is "
+               "read from git where git can tell, and from `gh pr view` where it cannot "
+               "— a squash merge is invisible to git. Nothing on the remote is deleted, "
+               "and nothing has to be deleted for a merged branch to be recognised.")
     reap.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
     reap.add_argument("--base", metavar="REF", default="main",
                       help="branch work merges into (default: main)")
     reap.add_argument("--remove", action="store_true", help="actually remove them")
     reap.add_argument("--delete-branch", action="store_true",
-                      help="also delete a branch git calls unmerged, when the work "
-                           "landed somewhere other than the base (squash merges)")
+                      help="also delete the local branch git calls unmerged, when the "
+                           "work landed somewhere other than the base (squash merges). "
+                           "Never touches the remote")
+    reap.add_argument("--no-forge", action="store_true",
+                      help="do not ask `gh` whether a pull request landed; judge by "
+                           "git alone, as on a repo with no forge and no gh")
     reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
                       help="task file dispatch writes, ignored when judging a "
                            "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)

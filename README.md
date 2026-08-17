@@ -42,14 +42,15 @@ plus every plugin `config/plugins.list` recommends.
 | **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
 | **node ≥ 23** | drovr, which runs its TypeScript through native type stripping and has no build step | both movers; nothing else |
 | **fzf** | drovr's picker | both movers. Also lost if it is too old — 0.44.1 rejects `--highlight-line` and `input-fg`, and the picker exits |
-| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
+| **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated; `gh` also for `reap`, asking whether a pull request landed | that one tab, which says so; the rest of reviewr is fine. `reap` falls back to its git-only signals and names the one it used |
 | **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
 | **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
 | **truecolor + Unicode box-drawing** | reviewr's TUI | a readable diff |
 
 The forge CLIs are reviewr's list, not ours: `gh` for GitHub, `glab` for
 GitLab, `az` with the `azure-devops` extension for Azure DevOps. Only `gh` has
-been used against this repo.
+been used against this repo, and only it is read here: `reap` uses it when it is
+there and works without it.
 
 herdr's floor is the highest one any installed plugin declares:
 
