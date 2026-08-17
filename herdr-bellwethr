@@ -29,7 +29,8 @@
 # pane are all things `reap` deletes, and everything the agent knew that is not
 # in the diff goes with them. `runs` is the other half: which dispatches are
 # still outstanding and what happened to the ones that finished, answered from
-# disk without waiting on anybody.
+# disk without waiting on anybody. `reap` will not remove a worktree whose run
+# was never reported.
 #
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
@@ -2126,8 +2127,8 @@ def show_run(record, path, by_pane, by_cwd, want_task):
     print("    %s report %s --file %s" % (PROG, record["id"], OUTCOME_DRAFT))
     print("")
     if live == "gone":
-        print("Its agent is gone, so nobody is going to. Read the pull request")
-        print("and record what you can yourself — a partial record beats none.")
+        print("Its agent is gone, so nobody is going to. Read the pull request,")
+        print("then either record it yourself or reap with --allow-unreported.")
     else:
         # Waiting is the caller's to do, one target at a time and never here:
         # an orchestrator that blocks on one agent cannot run several, and
@@ -2244,17 +2245,19 @@ LANDED_ELSEWHERE = (
 
 
 def is_dirty(path, task_file):
-    """Uncommitted work, ignoring the task file dispatch wrote.
+    """Uncommitted work, ignoring the files this tool's own protocol put there.
 
     Without this every dispatched worktree is dirty forever: `dispatch` writes
-    the task into the checkout and nothing ever commits it, so the one signal
-    that should mean "somebody is mid-edit here" would fire on all of them.
+    the task into the checkout, the task asks the agent to draft its outcome
+    beside it, nothing ever commits either, and the one signal that should mean
+    "somebody is mid-edit here" would fire on all of them.
     """
+    ours = (task_file, OUTCOME_DRAFT)
     code, out, _ = git(path, "status", "--porcelain")
     if code != 0:
         return None
     for line in out.splitlines():
-        if line[3:].strip() == task_file and line.startswith("??"):
+        if line.startswith("??") and line[3:].strip() in ours:
             continue
         if line.strip():
             return True
@@ -2290,12 +2293,11 @@ def landed_on_another_remote_branch(repo, branch):
     return False
 
 
-def reap_reason(repo, path, branch, base, workspaces, task_file):
-    """Why this worktree is or is not finished with, as (removable, reason).
+def landing_reason(repo, path, branch, base, workspaces, task_file):
+    """Whether the work in this worktree has landed, as (landed, reason).
 
-    The bar for removing is deliberately higher than the bar for keeping. A
-    worktree kept one day too long costs a directory; one removed a moment too
-    early costs whatever was in it.
+    Everything here is about the code. Whether anybody wrote down what the agent
+    knew is a separate question, asked by reap_reason on top of this one.
     """
     if not branch:
         return False, "detached HEAD — nothing to judge it by"
@@ -2347,6 +2349,59 @@ def reap_reason(repo, path, branch, base, workspaces, task_file):
     return False, "not merged into %s and not on another remote branch" % base
 
 
+def reap_reason(repo, path, branch, base, workspaces, task_file, runs, allow_unreported):
+    """Why this worktree is or is not finished with, as (removable, reason).
+
+    The bar for removing is deliberately higher than the bar for keeping. A
+    worktree kept one day too long costs a directory; one removed a moment too
+    early costs whatever was in it — and what is in it is not only the diff.
+
+    So landing is necessary and no longer sufficient. Removing takes the
+    worktree, the workspace and the agent's pane together, and everything the
+    agent knew that it did not commit goes with them; a run record with no
+    outcome is the evidence that nobody wrote any of it down. This refuses
+    rather than warning, because a warning printed among things being removed
+    only works when somebody happens to be reading, and depending on somebody
+    happening to be there is the habit the record replaced.
+
+    A worktree with no record at all is judged exactly as it was before. This
+    can only refuse on evidence it has, and inventing a reason to keep every
+    worktree that predates run records would be a different tool.
+    """
+    landed, reason = landing_reason(repo, path, branch, base, workspaces, task_file)
+    if not landed or allow_unreported:
+        return landed, reason
+    # Nothing to protect: the checkout is already gone, and the record survives
+    # it either way. Refusing here would leave the stale entry forever.
+    if not os.path.isdir(path):
+        return landed, reason
+
+    found = run_for(runs, path, branch)
+    if found is None or found[1].get("outcome") or found[1].get("reaped_at"):
+        return True, reason
+    return False, ("%s, but run %s has no outcome — read it with `%s runs %s`, "
+                   "ask the agent for one, or pass --allow-unreported"
+                   % (reason, run_id(found[0]), PROG, run_id(found[0])))
+
+
+def stamp_reaped(runs, path, branch, reason):
+    """Note on the record that the worktree it describes is gone.
+
+    The record outlives the checkout, so it has to stop claiming a directory
+    that is not there any more: `runs` reads this to tell a dispatcher whether
+    there is still an agent that could be asked anything.
+    """
+    found = run_for(runs, path, branch)
+    if found is None or found[1].get("reaped_at"):
+        return
+    record_path, record = found
+    record["reaped_at"] = now_stamp()
+    record["reaped_reason"] = reason
+    err = write_run(record_path, record)
+    if err:
+        warn("run %s still claims %s: %s" % (run_id(record_path), path, err))
+
+
 def cmd_reap(args):
     repo = repo_root(os.path.abspath(os.path.expanduser(args.repo or os.getcwd())))
 
@@ -2369,6 +2424,8 @@ def cmd_reap(args):
         if cwd:
             workspace_of.setdefault(os.path.realpath(cwd), pane.get("workspace_id"))
 
+    runs = load_runs(runs_dir(args.runs_dir))
+
     here = os.path.realpath(os.getcwd())
     removable, kept = [], []
 
@@ -2376,14 +2433,21 @@ def cmd_reap(args):
         if here == path or here.startswith(path + os.sep):
             kept.append((path, branch, "you are in it"))
             continue
-        ok, reason = reap_reason(repo, path, branch, args.base, workspaces, args.task_file)
+        ok, reason = reap_reason(repo, path, branch, args.base, workspaces,
+                                 args.task_file, runs, args.allow_unreported)
         (removable if ok else kept).append((path, branch, reason))
+
+    def entry(path, branch, reason):
+        found = run_for(runs, path, branch)
+        return {"path": path, "branch": branch, "reason": reason,
+                "run": None if found is None else run_id(found[0]),
+                "reported": bool(found and found[1].get("outcome"))}
 
     if args.json:
         print(json.dumps({
             "repo": repo,
-            "removable": [{"path": p, "branch": b, "reason": r} for p, b, r in removable],
-            "kept": [{"path": p, "branch": b, "reason": r} for p, b, r in kept],
+            "removable": [entry(p, b, r) for p, b, r in removable],
+            "kept": [entry(p, b, r) for p, b, r in kept],
             "removed": bool(args.remove),
         }, indent=2, sort_keys=True))
     else:
@@ -2420,6 +2484,7 @@ def cmd_reap(args):
                     warn("kept %s: %s" % (path, err.splitlines()[0] if err else "refused"))
                     continue
         git(repo, "worktree", "prune")
+        stamp_reaped(runs, path, branch, reason)
         # -d, never -D by default: git refuses a branch whose commits would be
         # lost, which is the one judgement here worth deferring to git for.
         code, _, err = git(repo, "branch", "-d", branch)
@@ -2615,7 +2680,10 @@ def main():
         description="Find dispatched worktrees whose work has landed.",
         epilog="Reports and removes nothing until --remove. A worktree kept a day too "
                "long costs a directory; one removed a moment too early costs whatever "
-               "was in it, so anything uncertain is kept and said out loud.")
+               "was in it, so anything uncertain is kept and said out loud. A worktree "
+               "whose run never reported an outcome is kept for the same reason: "
+               "removing it takes the agent's pane with it and whatever the agent knew "
+               "goes unwritten. Read it with `runs`, or say --allow-unreported.")
     reap.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
     reap.add_argument("--base", metavar="REF", default="main",
                       help="branch work merges into (default: main)")
@@ -2626,9 +2694,14 @@ def main():
     reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
                       help="task file dispatch writes, ignored when judging a "
                            "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)
+    reap.add_argument("--allow-unreported", action="store_true",
+                      help="remove a worktree whose run recorded no outcome — for an "
+                           "agent that died, or a run whose outcome is genuinely in "
+                           "the diff and nowhere else")
     reap.add_argument("--no-fetch", action="store_true",
                       help="skip `git fetch --prune`, use cached remote refs")
     reap.add_argument("--json", action="store_true", help="machine-readable")
+    runs_option(reap)
     shared(reap)
     reap.set_defaults(func=cmd_reap)
 
