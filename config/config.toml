@@ -42,7 +42,8 @@ description = "reviewr: toggle diff pane"
 # Plain key acts on the pane, shift on the tab, following herdr's own pairing
 # (prefix+x closes a pane, prefix+shift+x a tab). m was free in both.
 #
-# drovr needs node >= 23 and fzf, and is inert without either.
+# drovr needs node >= 23 and fzf, and is inert without either — see the README's
+# dependency table.
 [[keys.command]]
 key = "prefix+m"
 type = "plugin_action"
