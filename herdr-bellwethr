@@ -11,6 +11,8 @@
 #   herdr-bellwethr conventions              how this repo names branches
 #   herdr-bellwethr dispatch "<task>" --branch feat/x    hand it to an agent
 #   herdr-bellwethr reap                     worktrees that look finished with
+#   herdr-bellwethr agent-commands install --kind gemini   register the two
+#                                            above as that agent's own commands
 #
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
@@ -19,11 +21,13 @@
 """Save herdr-plus projects, and dispatch agents into worktrees."""
 
 import argparse
+import hashlib
 import json
 import os
 import os.path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -106,24 +110,43 @@ def herdr(*args):
     return payload.get("result", {})
 
 
+def xdg_config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def ask_config_dir(plugin_id):
+    """herdr's own answer for a plugin's config dir, or None if it has none."""
+    try:
+        proc = subprocess.run(
+            ("herdr", "plugin", "config-dir", plugin_id),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    path = proc.stdout.decode("utf-8", "replace").strip()
+    if not path or path.startswith("{"):
+        return None
+    return path
+
+
 def plugin_config_dir():
     """Where herdr-plus keeps projects/, asked of herdr rather than guessed.
 
     Outside herdr the plugin falls back to ~/.config/herdr-plus, and so do we.
     """
-    try:
-        proc = subprocess.run(
-            ("herdr", "plugin", "config-dir", PLUS_ID),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        proc = None
-    if proc is not None and proc.returncode == 0:
-        path = proc.stdout.decode("utf-8", "replace").strip()
-        if path and not path.startswith("{"):
-            return path
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "herdr-plus")
+    return ask_config_dir(PLUS_ID) or os.path.join(xdg_config_home(), "herdr-plus")
+
+
+def own_config_dir():
+    """Where this plugin keeps its own state — the agent-commands receipt.
+
+    The same question with our own id. The fallback is the path herdr would
+    have answered with, not a directory of our invention.
+    """
+    return ask_config_dir(PROG) or os.path.join(
+        xdg_config_home(), "herdr", "plugins", "config", PROG)
 
 
 def projects_dir(override):
@@ -1631,6 +1654,443 @@ def cmd_reap(args):
         # with. Delete one by hand if you mean to.
 
 
+# ---------------------------------------------------------- agent commands --
+
+def readable(path):
+    """A path with $HOME written the way a person reads it back."""
+    return tilde(path, os.path.expanduser("~"))
+
+
+
+# "dispatch this" and "reap" are ordinary English, and an orchestrator reading
+# them in a sentence has to decide whether they were meant as words or as
+# commands. It sometimes decides wrong. A registered command is not a decision:
+# /dispatch is never prose.
+#
+# The briefing for each verb is written once, agent-neutral, in config/agent/,
+# and rendered into whatever shape a given agent reads. Nothing here is specific
+# to one agent; a new one is a row in the table below.
+AGENT_COMMAND_NAMES = ("dispatch", "reap")
+
+# What a file in an agent's command directory looks like:
+#
+#   frontmatter  a YAML header (description, argument-hint), then the briefing
+#   markdown     the briefing and nothing else
+#   toml         description = "...", prompt = """..."""
+#   skill        a directory per command holding SKILL.md, named in its header
+SUFFIXES = {"frontmatter": ".md", "markdown": ".md", "toml": ".toml", "skill": ""}
+SHAPES = tuple(sorted(SUFFIXES))
+
+# Where each agent reads user-level commands from. Kinds are herdr's own names,
+# the ones `herdr agent start --kind` takes; herdr knows more of them than this
+# table does, and --dir is the answer for the rest.
+#
+# `dirs` is tried in order and the first that exists wins. Antigravity has moved
+# its skills directory once already, and a file written to the path it used to
+# read is a file nothing reads.
+#
+# `args` is the placeholder the agent substitutes the user's text for. None
+# means it has none, and the briefing says so in words instead.
+AGENT_TARGETS = {
+    "agy": {
+        "dirs": ("~/.gemini/antigravity-cli/skills", "~/.gemini/config/skills"),
+        "shape": "skill", "args": None,
+    },
+    "claude": {
+        "dirs": ("~/.claude/commands",),
+        "shape": "frontmatter", "args": "$ARGUMENTS",
+    },
+    "codex": {
+        "dirs": ("~/.codex/prompts",),
+        "shape": "frontmatter", "args": "$ARGUMENTS",
+    },
+    "cursor": {
+        "dirs": ("~/.cursor/commands",),
+        "shape": "markdown", "args": None,
+    },
+    "gemini": {
+        "dirs": ("~/.gemini/commands",),
+        "shape": "toml", "args": "{{args}}",
+    },
+    "opencode": {
+        "dirs": ("$XDG_CONFIG_HOME/opencode/commands", "~/.opencode/commands"),
+        "shape": "frontmatter", "args": "$ARGUMENTS",
+    },
+}
+
+NO_ARGS_TEXT = "(whatever was typed after the command name)"
+
+
+def expand_dir(path):
+    """~ and $XDG_CONFIG_HOME, the only two the table uses."""
+    return os.path.expanduser(path.replace("$XDG_CONFIG_HOME", xdg_config_home()))
+
+
+def briefing_dir():
+    """config/agent/, beside this script — realpath first, it is often a link."""
+    return os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "config", "agent")
+
+
+def read_briefing(name):
+    """One verb's neutral text, as (metadata, body).
+
+    The header is `key: value` lines between two `---` markers. Not YAML: the
+    two keys it has are strings, and a reader for those is four lines.
+    """
+    path = os.path.join(briefing_dir(), name + ".md")
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except OSError as exc:
+        die("could not read the %s briefing (%s): %s" % (name, path, exc))
+
+    meta = {}
+    body = text
+    if text.startswith("---\n"):
+        header, _, body = text[4:].partition("\n---\n")
+        for line in header.splitlines():
+            key, sep, value = line.partition(":")
+            if sep:
+                meta[key.strip()] = value.strip()
+    return meta, body.strip() + "\n"
+
+
+def toml_string(text):
+    return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def toml_block(text):
+    """A TOML multi-line basic string; a backslash in it would be an escape."""
+    return '"""\n%s"""' % text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+
+
+def render(shape, name, meta, body):
+    description = meta.get("description", "")
+    hint = meta.get("argument-hint", "")
+
+    if shape == "toml":
+        lines = ["# Written by `%s agent-commands install`." % PROG, ""]
+        if description:
+            lines.append("description = %s" % toml_string(description))
+        lines.append("prompt = %s" % toml_block(body))
+        return "\n".join(lines) + "\n"
+
+    if shape == "markdown":
+        return body
+
+    header = ["---"]
+    if shape == "skill":
+        header.append("name: %s" % name)
+    if description:
+        header.append("description: %s" % description)
+    if hint and shape == "frontmatter":
+        header.append("argument-hint: %s" % hint)
+    header.append("---")
+    return "\n".join(header) + "\n\n" + body
+
+
+def rendered_files(shape, args_token):
+    """{path relative to the command directory: contents}, for every verb."""
+    files = {}
+    for name in AGENT_COMMAND_NAMES:
+        meta, body = read_briefing(name)
+        body = body.replace("{{args}}", args_token or NO_ARGS_TEXT)
+        if shape == "skill":
+            files[os.path.join(name, "SKILL.md")] = render(shape, name, meta, body)
+        else:
+            files[name + SUFFIXES[shape]] = render(shape, name, meta, body)
+    return files
+
+
+def resolve_shape(kind, shape_override):
+    """(shape, args placeholder) for one agent kind.
+
+    The placeholder belongs to the agent rather than to the file shape, so
+    --shape does not change it: an agent that substitutes $ARGUMENTS does so
+    whichever kind of file it read.
+    """
+    target = AGENT_TARGETS.get(kind) or {}
+    return shape_override or target.get("shape") or "markdown", target.get("args")
+
+
+def resolve_dir(kind, dir_override):
+    """Which directory this kind's commands go in. Dies rather than guess."""
+    target = AGENT_TARGETS.get(kind)
+
+    if dir_override:
+        return os.path.abspath(os.path.expanduser(dir_override))
+
+    if not target:
+        die("no command directory recorded for %r.\n"
+            "\n"
+            "  Known here: %s\n"
+            "\n"
+            "  For any other agent, say where it reads user commands from and\n"
+            "  what a file there looks like:\n"
+            "\n"
+            "    %s agent-commands install --kind %s --dir PATH --shape %s"
+            % (kind, ", ".join(sorted(AGENT_TARGETS)), PROG, kind, "|".join(SHAPES)))
+
+    candidates = [expand_dir(d) for d in target["dirs"]]
+    for directory in candidates:
+        if os.path.isdir(directory):
+            return directory
+
+    # One candidate is a path this agent has always used, so create it. Several
+    # means the agent moved, and picking the wrong one writes files it will
+    # never read — with nothing to show for it either way.
+    if len(candidates) == 1:
+        return candidates[0]
+
+    die("%s reads commands from one of these, and none of them exists yet:%s\n"
+        "\n"
+        "  Install the agent first, or say which one it uses here:\n"
+        "\n"
+        "    %s agent-commands install --kind %s --dir PATH"
+        % (kind, "".join("\n    %s" % readable(c) for c in candidates), PROG, kind))
+
+
+def digest_of(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def receipt_path():
+    return os.path.join(own_config_dir(), "agent-commands.json")
+
+
+def load_receipt():
+    """What we have installed and what it looked like when we did.
+
+    An unreadable receipt is treated as an empty one: it records our own writes,
+    and refusing to run because we cannot read our own note helps nobody.
+    """
+    try:
+        with open(receipt_path()) as handle:
+            receipt = json.load(handle)
+    except (OSError, ValueError):
+        return {"kinds": {}}
+    if not isinstance(receipt, dict):
+        return {"kinds": {}}
+    receipt.setdefault("kinds", {})
+    return receipt
+
+
+def save_receipt(receipt):
+    path = receipt_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump(receipt, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError as exc:
+        die("could not write the receipt %s: %s" % (path, exc))
+
+
+def agent_commands_install(args):
+    if not args.kind:
+        die("say which agent: --kind %s" % "|".join(sorted(AGENT_TARGETS)))
+
+    shape, args_token = resolve_shape(args.kind, args.shape)
+    files = rendered_files(shape, args_token)
+
+    # Printing writes nothing, so it does not need a directory to be resolvable
+    # — an agent this does not know, or one not installed here, still renders.
+    if args.stdout:
+        directory = os.path.abspath(os.path.expanduser(args.dir)) if args.dir else ""
+        for relative_path in sorted(files):
+            print("# %s" % os.path.join(directory, relative_path))
+            print(files[relative_path])
+        return
+
+    directory = resolve_dir(args.kind, args.dir)
+    receipt = load_receipt()
+    ours = set(record.get("path") for record
+               in (receipt["kinds"].get(args.kind) or {}).get("files", []))
+
+    # A file we did not write is somebody else's command by the same name.
+    # Ours we overwrite without asking: that is what installing again means.
+    clashes = []
+    for relative_path in sorted(files):
+        path = os.path.join(directory, relative_path)
+        if os.path.exists(path) and path not in ours:
+            clashes.append(path)
+
+    if clashes and not args.force:
+        die("these exist already and are not ours:%s\n"
+            "\n"
+            "  Read them first — an agent can only have one command by a given\n"
+            "  name. --force overwrites them, keeping a copy under %s."
+            % ("".join("\n    %s" % readable(c) for c in clashes),
+               readable(os.path.join(own_config_dir(), "agent-commands-backups"))))
+
+    backup_root = os.path.join(own_config_dir(), "agent-commands-backups",
+                               time.strftime("%Y%m%d-%H%M%S"))
+    written = []
+    backed_up = False
+
+    for relative_path in sorted(files):
+        path = os.path.join(directory, relative_path)
+        contents = files[relative_path]
+        try:
+            if os.path.exists(path) and digest_of(path) != hashlib.sha256(
+                    contents.encode("utf-8")).hexdigest():
+                backup = os.path.join(backup_root, relative_path)
+                os.makedirs(os.path.dirname(backup), exist_ok=True)
+                shutil.copy2(path, backup)
+                backed_up = True
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as handle:
+                handle.write(contents)
+        except OSError as exc:
+            die("could not write %s: %s" % (path, exc))
+        written.append({
+            "path": path,
+            "sha256": hashlib.sha256(contents.encode("utf-8")).hexdigest(),
+        })
+
+    receipt["kinds"][args.kind] = {
+        "dir": directory,
+        "shape": shape,
+        "files": written,
+        "installed": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    save_receipt(receipt)
+
+    print("installed %s for %s" % (" and ".join(AGENT_COMMAND_NAMES), args.kind))
+    for record in written:
+        print("  %s" % readable(record["path"]))
+    if backed_up:
+        print("  replaced: %s" % readable(backup_root))
+    print("  receipt:  %s" % readable(receipt_path()))
+    print("")
+    print("Start a new %s session for it to read them." % args.kind)
+    notify("Herdr Bellwethr: agent commands", "installed for %s" % args.kind)
+
+
+def agent_commands_remove(args):
+    receipt = load_receipt()
+    kinds = receipt["kinds"]
+
+    if args.kind:
+        if args.kind not in kinds:
+            die("nothing installed for %s according to %s"
+                % (args.kind, readable(receipt_path())))
+        chosen = [args.kind]
+    elif kinds:
+        chosen = sorted(kinds)
+    else:
+        die("nothing to remove: %s lists no agent" % readable(receipt_path()))
+
+    removed = []
+    kept = []
+
+    for kind in chosen:
+        entry = kinds[kind]
+        surviving = []
+        for record in entry.get("files", []):
+            path = record.get("path")
+            if not path or not os.path.exists(path):
+                continue
+            # Edited since we wrote it means it is no longer only ours to
+            # delete. The recorded digest is what makes that answerable.
+            if digest_of(path) != record.get("sha256") and not args.force:
+                kept.append(path)
+                surviving.append(record)
+                continue
+            try:
+                os.remove(path)
+            except OSError as exc:
+                die("could not remove %s: %s" % (path, exc))
+            removed.append(path)
+            if entry.get("shape") == "skill":
+                try:
+                    os.rmdir(os.path.dirname(path))
+                except OSError:
+                    pass
+
+        if surviving:
+            entry["files"] = surviving
+        else:
+            del kinds[kind]
+
+    save_receipt(receipt)
+
+    for path in removed:
+        print("removed %s" % readable(path))
+    for path in kept:
+        print("kept    %s   (edited since it was installed; --force removes it)"
+              % readable(path))
+    if not removed and not kept:
+        print("nothing left to remove")
+    notify("Herdr Bellwethr: agent commands",
+           "removed %d file(s)" % len(removed))
+
+
+def agent_commands_status(args):
+    receipt = load_receipt()
+    kinds = receipt["kinds"]
+
+    def describe(kind):
+        """(state, directory) for one kind, as the receipt and disk agree."""
+        entry = kinds.get(kind)
+        if entry:
+            records = entry.get("files", [])
+            missing = [r for r in records if not os.path.exists(r.get("path", ""))]
+            edited = [r for r in records
+                      if os.path.exists(r.get("path", ""))
+                      and digest_of(r["path"]) != r.get("sha256")]
+            if missing:
+                state = "gone from disk" if len(missing) == len(records) else "partly gone"
+            elif edited:
+                state = "installed, edited"
+            else:
+                state = "installed"
+            return state, entry.get("dir", "?")
+
+        target = AGENT_TARGETS.get(kind)
+        if not target:
+            return "not installed", "?"
+        for directory in (expand_dir(d) for d in target["dirs"]):
+            if os.path.isdir(directory):
+                return "not installed", directory
+        return "agent not found", " or ".join(
+            readable(expand_dir(d)) for d in target["dirs"])
+
+    known = [(kind,) + describe(kind) for kind in sorted(set(AGENT_TARGETS) | set(kinds))]
+
+    if args.json:
+        print(json.dumps({
+            "briefings": briefing_dir(),
+            "receipt": receipt_path(),
+            "commands": list(AGENT_COMMAND_NAMES),
+            "kinds": dict((kind, {"state": state, "dir": directory})
+                          for kind, state, directory in known),
+        }, indent=2, sort_keys=True))
+        return
+
+    print("commands:  %s" % ", ".join(AGENT_COMMAND_NAMES))
+    print("briefings: %s" % readable(briefing_dir()))
+    print("receipt:   %s" % readable(receipt_path()))
+    print("")
+    for kind, state, directory in known:
+        marker = "  " if state.startswith("installed") else "! "
+        print("%s%-10s %-18s %s" % (marker, kind, state, readable(directory)))
+    print("")
+    print("An agent kind not listed: --kind <it> --dir PATH --shape %s"
+          % "|".join(SHAPES))
+
+
+def cmd_agent_commands(args):
+    if args.action == "install":
+        agent_commands_install(args)
+    elif args.action == "remove":
+        agent_commands_remove(args)
+    else:
+        agent_commands_status(args)
+
+
 # -------------------------------------------------------------------- main --
 
 def main():
@@ -1754,6 +2214,34 @@ def main():
     reap.add_argument("--json", action="store_true", help="machine-readable")
     shared(reap)
     reap.set_defaults(func=cmd_reap)
+
+    agent_commands = subparsers.add_parser(
+        "agent-commands", help="register dispatch and reap with an agent",
+        description="Install dispatch and reap as an agent's own commands.",
+        epilog="\"dispatch\" and \"reap\" are ordinary English until the agent has "
+               "commands by those names, and an orchestrator that has to decide which "
+               "was meant sometimes decides wrong. The briefing for each is written "
+               "once, in config/agent/, and rendered into the shape the agent reads.")
+    agent_commands.add_argument("action", nargs="?", default="status",
+                                choices=("status", "install", "remove"),
+                                help="default: status")
+    agent_commands.add_argument("--kind", metavar="KIND",
+                                help="agent kind, named as `herdr agent start --kind` "
+                                     "names it (known here: %s)"
+                                     % ", ".join(sorted(AGENT_TARGETS)))
+    agent_commands.add_argument("--dir", metavar="PATH",
+                                help="command directory to write to, for an agent this "
+                                     "does not know or one that reads another path")
+    agent_commands.add_argument("--shape", choices=SHAPES,
+                                help="what a file there looks like (default: the kind's)")
+    agent_commands.add_argument("--stdout", action="store_true",
+                                help="print the files, write nothing")
+    agent_commands.add_argument("--force", action="store_true",
+                                help="install over files that are not ours; remove ones "
+                                     "edited since they were installed")
+    agent_commands.add_argument("--json", action="store_true", help="machine-readable")
+    shared(agent_commands)
+    agent_commands.set_defaults(func=cmd_agent_commands)
 
     args = parser.parse_args()
     if not args.command:
