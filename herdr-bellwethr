@@ -1016,9 +1016,32 @@ AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 DEFAULT_TASK_FILE = "TASK.md"
 
-# The one instruction dispatch is entitled to give an agent, because it is about
-# how the work is handed back rather than about what the work is. Every task
-# needs it and no task remembers to say it.
+# The two instructions dispatch is entitled to give an agent, because both are
+# about the handover it arranged rather than about what the work is. Every task
+# needs them and no task remembers to say them.
+
+# The task arrives as the requester wrote it, which means it is as incomplete as
+# they left it. An agent that is not told this fills the gaps in silently; one
+# that is told it, in a session somebody is reading, can ask instead.
+ASKING_RULE = """\
+---
+
+## What this task says, and what it does not
+
+Everything above this line is the task as its requester wrote it, carried here
+unchanged. Nothing was looked up on your behalf and nothing was filled in on
+the way: no file or line numbers you were not given, no conventions, no
+conclusions about what the code currently does or why. Where it is silent, it
+is silent because the requester did not say — not because something was
+dropped in transit.
+
+This session is interactive and whoever dispatched it can read it and answer.
+Read the repository for what the repository can tell you, and ask here for the
+rest rather than deciding it yourself: which of two readings was meant, whether
+a constraint holds, where something lives. A question costs a message; a guess
+costs whatever gets built on it.
+"""
+
 REPORTING_RULE = """\
 ---
 
@@ -1184,17 +1207,20 @@ def fail(args, stage, message, detail=""):
 
 
 def task_document(args, repo, checkout, branch, workspace_id, pane_id):
-    """The task, the rule for handing the work back, and where that happens.
+    """The task as written, dispatch's own two rules, and where that runs.
 
     An agent dropped into a fresh worktree cannot tell it is in one, and reasons
     about it as the repository — which is how a task written in the primary
     checkout ends up asking for something only that checkout can do.
 
     Facts, not instructions: what to do about them belongs in the task. The
-    reporting rule is the exception, and stays one — it is dispatch's own rule
-    about the handover it arranged, not advice about the task it is carrying.
+    asking and reporting rules are the exceptions, and stay the only two — they
+    are dispatch's own rules about the handover it arranged, not advice about
+    the task it is carrying. The task itself goes in as it came: dispatch adds
+    nothing to it, expands nothing in it and summarises none of it.
     """
-    document = "%s\n\n%s" % (args.task.rstrip("\n"), REPORTING_RULE)
+    document = "%s\n\n%s\n%s" % (
+        args.task.rstrip("\n"), ASKING_RULE, REPORTING_RULE)
     if args.no_context:
         return document
 
@@ -1600,13 +1626,19 @@ def main():
     dispatch = subparsers.add_parser(
         "dispatch", help="hand a task to an agent in a fresh worktree",
         description="Create a worktree, start an agent in it, and give it the task.",
-        epilog="--branch is required and never derived: which names a repo accepts is "
-               "the repo's business, so ask `conventions` first and let the caller "
-               "choose. A branch the repo's pre-commit hook rejects is reported with "
-               "that hook's own words, and everything created is torn down again. The "
-               "agent's name is forgotten if herdr restarts, so hold on to the pane id "
-               "it reports — that keeps working.")
-    dispatch.add_argument("task", help="the task, written into the worktree for the agent")
+        epilog="The task is written into the worktree exactly as given, so give it in "
+               "the requester's own words and not as a briefing about them: findings, "
+               "line numbers, conventions and conclusions gathered by whoever calls "
+               "this are guesses by the time the agent reads them, and the agent's "
+               "session is interactive and can ask. --branch is required and never "
+               "derived: which names a repo accepts is the repo's business, so ask "
+               "`conventions` first and let the caller choose. A branch the repo's "
+               "pre-commit hook rejects is reported with that hook's own words, and "
+               "everything created is torn down again. The agent's name is forgotten "
+               "if herdr restarts, so hold on to the pane id it reports — that keeps "
+               "working.")
+    dispatch.add_argument("task", help="the task in the requester's own words, written "
+                                       "into the worktree for the agent unchanged")
     dispatch.add_argument("--branch", required=True, metavar="NAME",
                           help="branch to create (required; nothing here invents one)")
     dispatch.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
@@ -1623,8 +1655,9 @@ def main():
                           help="what to say to the agent (default: read the task file)")
     dispatch.add_argument("--no-context", action="store_true",
                           help="leave out the note saying which worktree and "
-                               "branch it is running in (the rule about how the "
-                               "work is reported is always written)")
+                               "branch it is running in (the rules about asking "
+                               "and about how the work is reported are always "
+                               "written)")
     dispatch.add_argument("--no-probe", action="store_true",
                           help="skip asking the repo's pre-commit about the branch name")
     dispatch.add_argument("--focus", action="store_true", help="focus the new workspace")
