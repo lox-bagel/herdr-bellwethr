@@ -1,4 +1,0 @@
-name = "Drovr: move pane       "
-description = "(prefix+m):       Move the focused pane into another tab."
-type = "command"
-command = "herdr plugin action invoke drovr.move-pane"

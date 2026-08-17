@@ -40,8 +40,6 @@ plus every plugin `config/plugins.list` recommends.
 | --- | --- | --- |
 | **herdr** | all of it — this is a herdr plugin and a caller of its CLI | nothing here runs |
 | **jq** | reviewr (`herdr/pane.sh`: its config and every herdr reply), automatic-rename (throughout) | reviewr's pane actions refuse; automatic-rename does nothing |
-| **node ≥ 23** | drovr, which runs its TypeScript through native type stripping and has no build step | both movers; nothing else |
-| **fzf** | drovr's picker | both movers. Also lost if it is too old — 0.44.1 rejects `--highlight-line` and `input-fg`, and the picker exits |
 | **gh** / **glab** / **az** | reviewr's PR tab, matched to the remote's host, authenticated | that one tab, which says so; the rest of reviewr is fine |
 | **an agent CLI** | `dispatch` (`--kind claude` by default, started by herdr); reviewr's Send targets an agent herdr detected | dispatch cannot hand off; Send has nowhere to send |
 | **a Nerd Font** | automatic-rename with `ICONS_ENABLED=1`, off by default | the glyphs |
@@ -57,7 +55,6 @@ herdr's floor is the highest one any installed plugin declares:
 | --- | --- |
 | herdr-bellwethr, herdr-plus | ≥ 0.7.0 |
 | automatic-rename | ≥ 0.7.1 |
-| drovr | ≥ 0.7.4 |
 | herdr-lazy, reviewr | ≥ 0.7.5 |
 
 ## Working on it
