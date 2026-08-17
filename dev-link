@@ -7,6 +7,18 @@
 #   dev-link apply --adopt   first copy any live-only content back into the repo
 #   dev-link remove     turn every link back into a plain file (repo content)
 #
+# Run it from the primary checkout. A `git worktree` has its own copy of
+# config/, and only one checkout can own the symlinks in a given herdr install,
+# so from a worktree the target has to be named rather than inferred:
+#
+#   mkdir -p /tmp/herdr-test
+#   ./dev-link apply --herdr-config /tmp/herdr-test/herdr
+#   XDG_CONFIG_HOME=/tmp/herdr-test herdr --session test
+#
+# That second herdr has its own config.toml, plugin registry and socket, so a
+# change under test cannot break the session you are working in. Testing there
+# rather than in your own herdr is worth doing from the primary checkout too.
+#
 # This exists so an edit lands in one place during development. It is not the
 # installer: the installer will *copy* files and record a receipt, because a
 # user's config should not depend on a checkout staying where it was. Symlinks
@@ -66,8 +78,16 @@ def die(msg):
 
 # ------------------------------------------------------------------ herdr ---
 
-def herdr_config_dir():
-    """Where herdr keeps config.toml, plugins.json and the plugin config dirs."""
+def herdr_config_dir(override=None):
+    """Which herdr install we are pointing at.
+
+    An explicit --herdr-config wins, because saying it is the whole point: from
+    anywhere but the primary checkout it is required, so the target is never
+    something this tool inferred. Otherwise the session we are running inside,
+    which HERDR_SOCKET_PATH names, and failing that the default location.
+    """
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     socket = os.environ.get("HERDR_SOCKET_PATH")
     if socket:
         return os.path.dirname(socket)
@@ -75,12 +95,21 @@ def herdr_config_dir():
     return os.path.join(base, "herdr")
 
 
-def plugin_config_dir(plugin_id):
+def plugin_config_dir(plugin_id, config_dir):
     """Ask herdr, the same way herdr-bellwethr does — never guess this path.
 
     herdr provisions the directory and keeps it across plugin upgrades, so it is
     the one the plugin itself will read.
+
+    Only for the install we are actually running inside, though. `herdr plugin
+    config-dir` answers for the session on the other end of the socket, so
+    asking it about some other config dir returns the wrong path with no sign
+    that it did. For an explicit target the layout is the answer, and herdr
+    creates the directory on first use either way.
     """
+    if config_dir != herdr_config_dir():
+        return os.path.join(config_dir, "plugins", "config", plugin_id)
+
     try:
         proc = subprocess.run(
             ("herdr", "plugin", "config-dir", plugin_id),
@@ -92,12 +121,76 @@ def plugin_config_dir(plugin_id):
         path = proc.stdout.decode("utf-8", "replace").strip()
         if path and not path.startswith("{"):
             return path
-    return os.path.join(herdr_config_dir(), "plugins", "config", plugin_id)
+    return os.path.join(config_dir, "plugins", "config", plugin_id)
+
+
+# -------------------------------------------------------------- checkouts ---
+
+def is_primary_checkout():
+    """False in a `git worktree` checkout, true in the clone it was made from.
+
+    A linked worktree keeps its own .git *file* pointing into the primary's
+    .git directory, so the two paths differ there and match here.
+    """
+    try:
+        proc = subprocess.run(
+            ("git", "rev-parse", "--git-dir", "--git-common-dir"),
+            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return True
+    if proc.returncode != 0:
+        return True
+    lines = proc.stdout.decode("utf-8", "replace").split()
+    if len(lines) != 2:
+        return True
+    git_dir, common = (os.path.realpath(os.path.join(REPO, p)) for p in lines)
+    return git_dir == common
+
+
+def require_explicit_target(override):
+    """Refuse to guess which install a worktree is allowed to write to.
+
+    Worktrees are the reason this exists. git will not check the same branch out
+    twice, but `--detach` will happily give you a second tree at the same commit
+    that then drifts, and every worktree has its own copy of config/ — so
+    "the files this repo installs" stops being one answer the moment there is
+    more than one checkout. Whichever tree ran `apply` last owns the symlinks,
+    the others silently do not, and `herdr worktree remove` on the winner leaves
+    the install pointing at a directory that is gone.
+
+    Rather than rank the checkouts, this refuses to infer anything: outside the
+    primary one, name the install. The reasonable target is a throwaway herdr
+    that a broken config cannot cost you anything in, which is a directory and
+    an environment variable:
+
+        mkdir -p /tmp/herdr-test
+        ./dev-link apply --herdr-config /tmp/herdr-test/herdr
+        XDG_CONFIG_HOME=/tmp/herdr-test herdr --session test
+
+    That herdr has its own config.toml, its own plugin registry and its own
+    socket, so testing a change to either cannot disturb the session you are
+    reading this in.
+    """
+    if override or is_primary_checkout():
+        return
+
+    die(
+        "this is a linked worktree, not the primary checkout.\n"
+        "\n"
+        "  Every worktree has its own config/, and only one of them can own the\n"
+        "  symlinks in a given herdr install. Say which install you mean:\n"
+        "\n"
+        "    ./dev-link apply --herdr-config /tmp/herdr-test/herdr\n"
+        "    XDG_CONFIG_HOME=/tmp/herdr-test herdr --session test\n"
+        "\n"
+        "  To change the herdr you are using now, work in the primary checkout."
+    )
 
 
 # ------------------------------------------------------------------ links ---
 
-def targets():
+def targets(config_dir):
     """Every (repo file, live path) pair this tool manages, in apply order.
 
     Quick actions are listed one file at a time rather than linking the
@@ -110,18 +203,18 @@ def targets():
 
     pairs.append((
         os.path.join(REPO, "config", "config.toml"),
-        os.path.join(herdr_config_dir(), "config.toml"),
+        os.path.join(config_dir, "config.toml"),
     ))
 
     quick = os.path.join(REPO, "config", "quick-actions")
-    live_quick = os.path.join(plugin_config_dir(PLUS_ID), "quick-actions")
+    live_quick = os.path.join(plugin_config_dir(PLUS_ID, config_dir), "quick-actions")
     for name in sorted(os.listdir(quick)):
         if name.endswith(".toml"):
             pairs.append((os.path.join(quick, name), os.path.join(live_quick, name)))
 
     pairs.append((
         os.path.join(REPO, "config", "plugins.list"),
-        os.path.join(plugin_config_dir(LAZY_ID), "plugins.list"),
+        os.path.join(plugin_config_dir(LAZY_ID, config_dir), "plugins.list"),
     ))
 
     return pairs
@@ -167,9 +260,9 @@ def relative(path):
 
 # ----------------------------------------------------------------- backups ---
 
-def backup_root():
+def backup_root(config_dir):
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return os.path.join(herdr_config_dir(), "bellwethr-backups", stamp)
+    return os.path.join(config_dir, "bellwethr-backups", stamp)
 
 
 def back_up(live_path, root):
@@ -187,8 +280,18 @@ def back_up(live_path, root):
 # -------------------------------------------------------------- subcommands --
 
 def cmd_status(args):
+    config_dir = herdr_config_dir(args.herdr_config)
+
+    # Which checkout and which install, before the list — the same file list
+    # says something different depending on both, and status is the command you
+    # run when you are not sure.
+    print("checkout: %s%s" % (
+        relative(REPO), "" if is_primary_checkout() else "  (linked worktree)"))
+    print("install:  %s" % relative(config_dir))
+    print("")
+
     counts = {}
-    for repo_path, live_path in targets():
+    for repo_path, live_path in targets(config_dir):
         kind = state(repo_path, live_path)
         counts[kind] = counts.get(kind, 0) + 1
         marker = "  " if kind in ("linked", "same") else "! "
@@ -196,9 +299,9 @@ def cmd_status(args):
 
     print("")
     print("not managed by this tool:")
-    lock = os.path.join(plugin_config_dir(LAZY_ID), "plugins.lock")
+    lock = os.path.join(plugin_config_dir(LAZY_ID, config_dir), "plugins.lock")
     print("  %-24s %s" % ("herdr-lazy rewrites it", relative(lock)))
-    projects = os.path.join(plugin_config_dir(PLUS_ID), "projects")
+    projects = os.path.join(plugin_config_dir(PLUS_ID, config_dir), "projects")
     print("  %-24s %s" % ("user data", relative(projects)))
 
     print("")
@@ -219,7 +322,9 @@ def cmd_status(args):
 
 
 def cmd_apply(args):
-    pairs = targets()
+    require_explicit_target(args.herdr_config)
+    config_dir = herdr_config_dir(args.herdr_config)
+    pairs = targets(config_dir)
 
     # Refuse the whole run rather than half of it. A partial apply leaves the
     # machine in a state neither `status` nor the user can reason about.
@@ -244,7 +349,7 @@ def cmd_apply(args):
         )
         return 1
 
-    root = backup_root()
+    root = backup_root(config_dir)
     linked = adopted = already = 0
 
     for repo_path, live_path in pairs:
@@ -280,8 +385,11 @@ def cmd_remove(args):
     as it is now — the point is to stop the live config depending on this
     checkout, not to strip the config out.
     """
+    require_explicit_target(args.herdr_config)
+    config_dir = herdr_config_dir(args.herdr_config)
+
     restored = skipped = 0
-    for repo_path, live_path in targets():
+    for repo_path, live_path in targets(config_dir):
         kind = state(repo_path, live_path)
         if kind != "linked":
             if kind not in ("absent",):
@@ -316,6 +424,13 @@ def main():
 
     remove = subparsers.add_parser("remove", help="turn links back into plain files")
     remove.set_defaults(func=cmd_remove)
+
+    # On every subcommand rather than on the parser, so it can follow the verb:
+    # `apply --herdr-config X` is the order people type it in.
+    for sub in (status, apply_cmd, remove):
+        sub.add_argument("--herdr-config", metavar="DIR",
+                         help="herdr config dir to target; required outside the "
+                              "primary checkout (e.g. /tmp/herdr-test/herdr)")
 
     args = parser.parse_args()
     if not getattr(args, "func", None):
