@@ -6,3 +6,9 @@ natori-hrj/herdr-lazy
 cloudmanic/herdr-plus
 persiyanov/herdr-reviewr
 qu8n/herdr-automatic-rename
+
+# Declarative tab/pane layouts applied on worktree.created, including starting a
+# coding agent and handing it a prompt once herdr reports it ready. Needs a Rust
+# toolchain: its shim builds with cargo on first use and its manifest has no
+# build hook to fetch a prebuilt, unlike herdr-lazy's.
+razajamil/herdr-plugin-workspace-manager
