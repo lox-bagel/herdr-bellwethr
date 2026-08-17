@@ -8,9 +8,19 @@
 #   herdr-bellwethr list                     what is in the projects dir
 #   herdr-bellwethr delete "Options Cafe"    remove one
 #
+#   herdr-bellwethr conventions              how this repo names branches
+#   herdr-bellwethr dispatch "<task>" --branch feat/x    hand it to an agent
+#   herdr-bellwethr reap                     worktrees that look finished with
+#
 # `save` snapshots the space you are looking at — tabs, panes, split directions,
 # working dirs and the commands actually running — into one *.toml file in
 # herdr-plus's projects/ dir, so `prefix+shift+o` can rebuild it later.
+#
+# `dispatch` is the other direction: a worktree, an agent started in it, and the
+# task handed over once herdr reports the agent ready. It never invents a branch
+# name — which names a repo accepts is the repo's business, so `conventions`
+# reports the evidence and the caller chooses. `reap` clears up afterwards, and
+# removes nothing until told to.
 #
 # Reads live state over herdr's socket API (`herdr workspace|tab|pane ...`),
 # never ~/.config/herdr/session.json — that file is a persistence detail and
@@ -944,6 +954,515 @@ def cmd_delete(args):
     notify("Herdr Plus: project deleted", "%s — %s" % (label, os.path.basename(path)))
 
 
+# ------------------------------------------------------------------- git ----
+
+def git(repo, *args):
+    """Run git in `repo`. Returns (returncode, stdout, stderr), never dies.
+
+    Callers here care about the difference between "no" and "broken" often
+    enough that raising on non-zero would cost more than it saves — a branch
+    that is not merged and a repository that is not there both come back as a
+    non-zero exit, and only one of them is worth stopping for.
+    """
+    try:
+        proc = subprocess.run(
+            ("git",) + args, cwd=repo,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        return 1, "", str(exc)
+    return (proc.returncode,
+            proc.stdout.decode("utf-8", "replace").strip(),
+            proc.stderr.decode("utf-8", "replace").strip())
+
+
+def repo_root(path):
+    code, out, _ = git(path, "rev-parse", "--show-toplevel")
+    if code != 0 or not out:
+        die("not a git repository: %s" % path)
+    return out
+
+
+def hook_for(repo, name):
+    """The hook script this repo would actually run, or None.
+
+    core.hooksPath may be absent, relative or absolute, and a relative one is
+    resolved against the working tree — which is why a worktree gets its own
+    copy rather than the primary's.
+    """
+    code, configured, _ = git(repo, "config", "--get", "core.hooksPath")
+    hooks_dir = configured if code == 0 and configured else ".git/hooks"
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.join(repo, hooks_dir)
+    path = os.path.join(hooks_dir, name)
+    return path if os.access(path, os.X_OK) else None
+
+
+# -------------------------------------------------------------- conventions --
+
+def convention_evidence(repo):
+    """What a caller needs to pick a branch name this repo will accept.
+
+    Evidence, not rules. Nothing here encodes an opinion about naming — the
+    repo's own history and its own hooks are the authority, and a repo with
+    neither has no convention to violate.
+    """
+    _, subjects, _ = git(repo, "log", "--format=%s", "-n", "15")
+    _, branches, _ = git(
+        repo, "for-each-ref", "--format=%(refname:short)",
+        "--sort=-committerdate", "--count=15", "refs/heads", "refs/remotes")
+
+    hooks = {}
+    for name in ("pre-commit", "commit-msg", "pre-push", "prepare-commit-msg"):
+        found = hook_for(repo, name)
+        if found:
+            hooks[name] = found
+
+    docs = [
+        name for name in (
+            "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "CONVENTIONS.md",
+            os.path.join(".github", "PULL_REQUEST_TEMPLATE.md"),
+        )
+        if os.path.exists(os.path.join(repo, name))
+    ]
+
+    return {
+        "repo": repo,
+        "commit_subjects": [s for s in subjects.splitlines() if s],
+        "branches": [b for b in branches.splitlines() if b],
+        "hooks": hooks,
+        "convention_docs": docs,
+    }
+
+
+def cmd_conventions(args):
+    repo = repo_root(os.path.abspath(os.path.expanduser(args.repo or os.getcwd())))
+    evidence = convention_evidence(repo)
+
+    if args.json:
+        print(json.dumps(evidence, indent=2, sort_keys=True))
+        return
+
+    print("repo: %s" % evidence["repo"])
+    print("")
+    print("recent commit subjects:")
+    for subject in evidence["commit_subjects"]:
+        print("  %s" % subject)
+    print("")
+    print("recent branches:")
+    for branch in evidence["branches"]:
+        print("  %s" % branch)
+    print("")
+    if evidence["hooks"]:
+        print("hooks that will run (these are the authority, not the list above):")
+        for name in sorted(evidence["hooks"]):
+            print("  %-18s %s" % (name, evidence["hooks"][name]))
+    else:
+        print("hooks: none installed — nothing here enforces a naming convention")
+    if evidence["convention_docs"]:
+        print("")
+        print("worth reading: %s" % ", ".join(evidence["convention_docs"]))
+
+
+# ----------------------------------------------------------------- dispatch --
+
+# A herdr agent alias has to match this and be unique among *live* agents.
+AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+DEFAULT_TASK_FILE = "TASK.md"
+
+
+def agent_alias(branch, taken):
+    """A herdr agent name derived from the branch, distinct from the live ones."""
+    base = re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-") or "agent"
+    if not base[0].isalpha():
+        base = "a" + base
+    name = base[:40]
+    n = 2
+    while name in taken:
+        name = "%s-%d" % (base[:36], n)
+        n += 1
+    return name
+
+
+def live_agent_names():
+    return set(a.get("name") or a.get("agent_name") or ""
+               for a in herdr("agent", "list").get("agents", []))
+
+
+def probe_branch(checkout, branch):
+    """Ask the repo's own pre-commit whether it will accept this branch name.
+
+    Nothing is committed and nothing is staged: the hook is run for its opinion.
+    Ours answers on the branch name alone, which is the case worth catching
+    early — `worktree create` makes no commit, so without this the refusal lands
+    at the agent's first commit, deep into its session and awkward to unwind.
+
+    A hook that lints or runs tests may fail here for reasons that have nothing
+    to do with the name, so this is advisory: the output goes back verbatim and
+    the caller decides whether renaming is the answer. --no-probe skips it.
+    """
+    hook = hook_for(checkout, "pre-commit")
+    if hook is None:
+        return True, "no pre-commit hook in %s" % checkout
+
+    try:
+        proc = subprocess.run(
+            (hook,), cwd=checkout,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        return True, "could not run %s: %s" % (hook, exc)
+
+    output = proc.stdout.decode("utf-8", "replace").strip()
+    return proc.returncode == 0, output
+
+
+def workspace_for_repo(repo):
+    """An existing workspace whose panes sit in `repo`, or None.
+
+    workspace list does not report a working directory — only panes do — so the
+    mapping is built from the pane side.
+    """
+    prefix = os.path.realpath(repo) + os.sep
+    for pane in herdr("pane", "list").get("panes", []):
+        cwd = pane.get("cwd") or ""
+        if cwd and (os.path.realpath(cwd) + os.sep).startswith(prefix):
+            return pane.get("workspace_id")
+    return None
+
+
+def teardown(workspace_id, repo, branch, checkout):
+    """Undo a dispatch that failed after it had already built something.
+
+    Best effort and deliberately quiet about its own failures: this runs while
+    reporting a different error, and a teardown problem must not replace the
+    message explaining what actually went wrong.
+    """
+    if workspace_id:
+        try:
+            herdr_quiet("worktree", "remove", "--workspace", workspace_id)
+        except Exception:
+            pass
+    if checkout and os.path.isdir(checkout):
+        git(repo, "worktree", "remove", "--force", checkout)
+    git(repo, "worktree", "prune")
+    if branch:
+        git(repo, "branch", "-D", branch)
+
+
+def herdr_quiet(*args):
+    """herdr(), for calls whose failure is not worth dying over."""
+    try:
+        proc = subprocess.run(
+            ("herdr",) + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        return {}
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace")).get("result", {})
+    except ValueError:
+        return {}
+
+
+def fail(args, stage, message, detail=""):
+    """Report a dispatch failure in a form a caller can act on.
+
+    The orchestrator picking branch names is the audience for `stage` and
+    `detail`: a refusal at the probe stage carries the hook's own words, which
+    for a decent hook names the convention it wants.
+    """
+    if args.json:
+        print(json.dumps({
+            "ok": False, "stage": stage, "branch": args.branch,
+            "message": message, "detail": detail,
+        }, indent=2, sort_keys=True))
+    else:
+        sys.stderr.write("%s: %s: %s\n" % (PROG, stage, message))
+        if detail:
+            sys.stderr.write("\n%s\n" % detail)
+    notify(FAIL_TITLE, message)
+    sys.exit(1)
+
+
+def cmd_dispatch(args):
+    repo = repo_root(os.path.abspath(os.path.expanduser(args.repo or os.getcwd())))
+    branch = args.branch.strip()
+
+    if not branch or branch.startswith("-"):
+        fail(args, "branch", "not a usable branch name: %r" % args.branch)
+
+    code, _, _ = git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch)
+    if code == 0:
+        fail(args, "branch", "branch %s already exists" % branch,
+             "Pick another name, or check out the existing branch by hand.")
+
+    created = herdr("worktree", "create",
+                    "--cwd", repo, "--branch", branch, "--base", args.base,
+                    "--label", args.label or branch,
+                    "--focus" if args.focus else "--no-focus")
+
+    workspace_id = (created.get("workspace") or {}).get("workspace_id")
+    pane_id = (created.get("root_pane") or {}).get("pane_id")
+    checkout = ((created.get("workspace") or {}).get("worktree") or {}).get("checkout_path") \
+        or (created.get("root_pane") or {}).get("cwd")
+
+    if not (workspace_id and pane_id and checkout):
+        teardown(workspace_id, repo, branch, checkout)
+        fail(args, "worktree", "herdr did not report a workspace, pane and checkout")
+
+    if not args.no_probe:
+        ok, output = probe_branch(checkout, branch)
+        if not ok:
+            teardown(workspace_id, repo, branch, checkout)
+            fail(args, "probe",
+                 "the repo's pre-commit hook refused branch %s" % branch, output)
+
+    task_path = os.path.join(checkout, args.task_file)
+    try:
+        with open(task_path, "w") as handle:
+            handle.write(args.task.rstrip("\n") + "\n")
+    except OSError as exc:
+        teardown(workspace_id, repo, branch, checkout)
+        fail(args, "task", "could not write %s: %s" % (task_path, exc))
+
+    alias = args.agent_name or agent_alias(branch, live_agent_names())
+    if not AGENT_NAME_RE.match(alias):
+        teardown(workspace_id, repo, branch, checkout)
+        fail(args, "agent", "not a usable agent name: %r" % alias)
+
+    start = herdr_quiet("agent", "start", alias, "--kind", args.kind,
+                        "--pane", pane_id, "--timeout", str(args.agent_timeout))
+    if not start:
+        teardown(workspace_id, repo, branch, checkout)
+        fail(args, "agent", "%s did not come up in the new pane" % args.kind,
+             "herdr agent start returned nothing. Check `herdr agent explain`.")
+
+    prompt = args.prompt or (
+        "Read %s in the repository root and start on it." % args.task_file)
+
+    # Deliberately not torn down past this point. The agent is up and the task
+    # file is written, so a prompt that fails to land is something to retry by
+    # hand — throwing the worktree away would take the agent's session with it.
+    submitted = herdr_quiet("agent", "prompt", alias, prompt, "--wait",
+                            "--until", "working", "--timeout", str(args.prompt_timeout))
+
+    result = {
+        "ok": True,
+        "branch": branch,
+        "base": args.base,
+        "checkout": checkout,
+        "workspace": workspace_id,
+        "pane": pane_id,
+        "agent": alias,
+        "kind": args.kind,
+        "task_file": task_path,
+        "prompted": bool(submitted),
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("dispatched %s to %s (%s)" % (branch, alias, args.kind))
+        print("  checkout   %s" % checkout)
+        print("  workspace  %s   pane %s" % (workspace_id, pane_id))
+        print("  task       %s" % task_path)
+        if not submitted:
+            print("  ! the prompt did not land — submit it with "
+                  "`herdr agent prompt %s ...`" % alias)
+
+    notify("Herdr Bellwethr: dispatched", "%s → %s" % (branch, alias))
+
+
+# --------------------------------------------------------------------- reap --
+
+def worktree_entries(repo):
+    """This repo's linked worktrees, as (path, branch) — never the primary one."""
+    _, out, _ = git(repo, "worktree", "list", "--porcelain")
+    entries, current = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if current.get("worktree"):
+                entries.append(current)
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+
+    primary = os.path.realpath(repo)
+    out = []
+    for entry in entries:
+        path = os.path.realpath(entry.get("worktree", ""))
+        if not path or path == primary:
+            continue
+        branch = entry.get("branch", "")
+        out.append((path, branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else ""))
+    return out
+
+
+# Reasons that mean the work reached somewhere other than the base branch, so
+# a `git branch -d` refusal is git being literal rather than git being right.
+LANDED_ELSEWHERE = (
+    "its upstream branch is gone",
+    "its commits are on a remote branch",
+)
+
+
+def is_dirty(path, task_file):
+    """Uncommitted work, ignoring the task file dispatch wrote.
+
+    Without this every dispatched worktree is dirty forever: `dispatch` writes
+    the task into the checkout and nothing ever commits it, so the one signal
+    that should mean "somebody is mid-edit here" would fire on all of them.
+    """
+    code, out, _ = git(path, "status", "--porcelain")
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        if line[3:].strip() == task_file and line.startswith("??"):
+            continue
+        if line.strip():
+            return True
+    return False
+
+
+def reap_reason(repo, path, branch, base, workspaces, task_file):
+    """Why this worktree is or is not finished with, as (removable, reason).
+
+    The bar for removing is deliberately higher than the bar for keeping. A
+    worktree kept one day too long costs a directory; one removed a moment too
+    early costs whatever was in it.
+    """
+    if not branch:
+        return False, "detached HEAD — nothing to judge it by"
+    if branch == base:
+        return False, "is the base branch"
+
+    if not os.path.isdir(path):
+        return True, "checkout is gone"
+
+    dirty = is_dirty(path, task_file)
+    if dirty is None:
+        return False, "could not read its status"
+    if dirty:
+        return False, "has uncommitted changes"
+
+    # A branch with nothing of its own is not finished work, it is work that has
+    # not started. It also looks "merged" to every test below, since a branch at
+    # the base commit is trivially an ancestor of it — so an agent still reading
+    # its task would be reaped as done. Ask first.
+    code, ahead, _ = git(repo, "rev-list", "--count", "%s..%s" % (base, branch))
+    if code == 0 and ahead.strip() == "0":
+        return False, "no commits of its own yet"
+
+    code, unpushed, _ = git(path, "log", "--oneline", "@{upstream}..HEAD")
+    upstream_gone = code != 0
+    if not upstream_gone and unpushed:
+        return False, "has commits that are not pushed"
+
+    state = workspaces.get(os.path.realpath(path))
+    if state == "working":
+        return False, "an agent is still working in it"
+
+    code, _, _ = git(repo, "merge-base", "--is-ancestor", branch, base)
+    if code == 0:
+        return True, "merged into %s" % base
+
+    code, remotes, _ = git(repo, "branch", "--remotes", "--contains", branch)
+    if code == 0 and remotes:
+        return True, "its commits are on a remote branch"
+
+    if upstream_gone:
+        code, tracked, _ = git(repo, "config", "--get", "branch.%s.remote" % branch)
+        if code == 0 and tracked:
+            return True, "its upstream branch is gone"
+
+    return False, "not merged into %s and not on a remote" % base
+
+
+def cmd_reap(args):
+    repo = repo_root(os.path.abspath(os.path.expanduser(args.repo or os.getcwd())))
+
+    if not args.no_fetch:
+        git(repo, "fetch", "--prune", "--quiet")
+
+    # Which checkout a workspace is sitting in, so a busy agent is not evicted.
+    workspaces = {}
+    panes = herdr_quiet("pane", "list").get("panes", [])
+    states = {w.get("workspace_id"): w.get("agent_status")
+              for w in herdr_quiet("workspace", "list").get("workspaces", [])}
+    for pane in panes:
+        cwd = pane.get("cwd")
+        if cwd:
+            workspaces[os.path.realpath(cwd)] = states.get(pane.get("workspace_id"))
+
+    workspace_of = {}
+    for pane in panes:
+        cwd = pane.get("cwd")
+        if cwd:
+            workspace_of.setdefault(os.path.realpath(cwd), pane.get("workspace_id"))
+
+    here = os.path.realpath(os.getcwd())
+    removable, kept = [], []
+
+    for path, branch in worktree_entries(repo):
+        if here == path or here.startswith(path + os.sep):
+            kept.append((path, branch, "you are in it"))
+            continue
+        ok, reason = reap_reason(repo, path, branch, args.base, workspaces, args.task_file)
+        (removable if ok else kept).append((path, branch, reason))
+
+    if args.json:
+        print(json.dumps({
+            "repo": repo,
+            "removable": [{"path": p, "branch": b, "reason": r} for p, b, r in removable],
+            "kept": [{"path": p, "branch": b, "reason": r} for p, b, r in kept],
+            "removed": bool(args.remove),
+        }, indent=2, sort_keys=True))
+    else:
+        for path, branch, reason in removable:
+            print("%s %s — %s" % ("removing" if args.remove else "would remove",
+                                  branch or path, reason))
+        for path, branch, reason in kept:
+            print("  keeping  %s — %s" % (branch or path, reason))
+        if not args.remove and removable:
+            print("")
+            print("nothing was removed. Pass --remove to act on the list above.")
+
+    if not args.remove:
+        return
+
+    for path, branch, reason in removable:
+        workspace_id = workspace_of.get(path)
+        if workspace_id:
+            herdr_quiet("worktree", "remove", "--workspace", workspace_id)
+        if os.path.isdir(path):
+            git(repo, "worktree", "remove", path)
+        git(repo, "worktree", "prune")
+        # -d, never -D by default: git refuses a branch whose commits would be
+        # lost, which is the one judgement here worth deferring to git for.
+        code, _, err = git(repo, "branch", "-d", branch)
+        if code == 0:
+            continue
+
+        # A squash merge leaves the branch's own commits nowhere in the base, so
+        # git calls it unmerged however thoroughly the work landed. That is the
+        # normal case in a repo that squashes, and it is why --delete-branch
+        # exists — but only where something other than the base branch says the
+        # work arrived, never on the "merged into base" reading alone.
+        landed = reason in LANDED_ELSEWHERE
+        if args.delete_branch and landed:
+            code, _, err = git(repo, "branch", "-D", branch)
+            if code == 0:
+                print("  deleted branch %s (%s)" % (branch, reason))
+                continue
+
+        warn("kept branch %s: %s%s" % (
+            branch,
+            err.splitlines()[0] if err else "refused",
+            "" if args.delete_branch or not landed
+            else " — pass --delete-branch to remove it anyway"))
+
+
 # -------------------------------------------------------------------- main --
 
 def main():
@@ -997,6 +1516,69 @@ def main():
                         help="always show the fuzzy picker, ignoring any name given")
     shared(delete)
     delete.set_defaults(func=cmd_delete)
+
+    conventions = subparsers.add_parser(
+        "conventions", help="what a repo expects of a branch or commit name",
+        description="Report the evidence for naming a branch in a repo.",
+        epilog="Evidence, not rules: recent commits and branches, the hooks that will "
+               "actually run, and any convention docs. Nothing here has an opinion.")
+    conventions.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
+    conventions.add_argument("--json", action="store_true", help="machine-readable")
+    shared(conventions)
+    conventions.set_defaults(func=cmd_conventions)
+
+    dispatch = subparsers.add_parser(
+        "dispatch", help="hand a task to an agent in a fresh worktree",
+        description="Create a worktree, start an agent in it, and give it the task.",
+        epilog="--branch is required and never derived: which names a repo accepts is "
+               "the repo's business, so ask `conventions` first and let the caller "
+               "choose. A branch the repo's pre-commit hook rejects is reported with "
+               "that hook's own words, and everything created is torn down again.")
+    dispatch.add_argument("task", help="the task, written into the worktree for the agent")
+    dispatch.add_argument("--branch", required=True, metavar="NAME",
+                          help="branch to create (required; nothing here invents one)")
+    dispatch.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
+    dispatch.add_argument("--base", metavar="REF", default="main",
+                          help="what to branch from (default: main)")
+    dispatch.add_argument("--kind", metavar="KIND", default="claude",
+                          help="agent kind herdr should start (default: claude)")
+    dispatch.add_argument("--agent-name", metavar="NAME",
+                          help="agent alias (default: derived from the branch)")
+    dispatch.add_argument("--label", metavar="TEXT", help="workspace label (default: the branch)")
+    dispatch.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
+                          help="where to write the task (default: %s)" % DEFAULT_TASK_FILE)
+    dispatch.add_argument("--prompt", metavar="TEXT",
+                          help="what to say to the agent (default: read the task file)")
+    dispatch.add_argument("--no-probe", action="store_true",
+                          help="skip asking the repo's pre-commit about the branch name")
+    dispatch.add_argument("--focus", action="store_true", help="focus the new workspace")
+    dispatch.add_argument("--agent-timeout", type=int, default=60000, metavar="MS")
+    dispatch.add_argument("--prompt-timeout", type=int, default=60000, metavar="MS")
+    dispatch.add_argument("--json", action="store_true", help="machine-readable")
+    shared(dispatch)
+    dispatch.set_defaults(func=cmd_dispatch)
+
+    reap = subparsers.add_parser(
+        "reap", help="report worktrees that look finished with",
+        description="Find dispatched worktrees whose work has landed.",
+        epilog="Reports and removes nothing until --remove. A worktree kept a day too "
+               "long costs a directory; one removed a moment too early costs whatever "
+               "was in it, so anything uncertain is kept and said out loud.")
+    reap.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
+    reap.add_argument("--base", metavar="REF", default="main",
+                      help="branch work merges into (default: main)")
+    reap.add_argument("--remove", action="store_true", help="actually remove them")
+    reap.add_argument("--delete-branch", action="store_true",
+                      help="also delete a branch git calls unmerged, when the work "
+                           "landed somewhere other than the base (squash merges)")
+    reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
+                      help="task file dispatch writes, ignored when judging a "
+                           "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)
+    reap.add_argument("--no-fetch", action="store_true",
+                      help="skip `git fetch --prune`, use cached remote refs")
+    reap.add_argument("--json", action="store_true", help="machine-readable")
+    shared(reap)
+    reap.set_defaults(func=cmd_reap)
 
     args = parser.parse_args()
     if not args.command:
