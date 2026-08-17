@@ -1561,13 +1561,26 @@ def cmd_reap(args):
     if not args.remove:
         return
 
+    task_file = args.task_file
     for path, branch, reason in removable:
         workspace_id = workspace_of.get(path)
         if workspace_id:
             herdr_quiet("worktree", "remove", "--workspace", workspace_id)
             herdr_quiet("workspace", "close", workspace_id)
         if os.path.isdir(path):
-            git(repo, "worktree", "remove", path)
+            code, _, err = git(repo, "worktree", "remove", path)
+            if code != 0:
+                # git refuses to remove a worktree holding anything untracked,
+                # and every dispatched worktree holds the task file dispatch
+                # wrote there. reap_reason already decided nothing else is
+                # uncommitted, so forcing removes only that file — but the
+                # check is repeated here rather than assumed, because the
+                # decision was made before anything below started running.
+                if is_dirty(path, task_file) is False:
+                    code, _, err = git(repo, "worktree", "remove", "--force", path)
+                if code != 0:
+                    warn("kept %s: %s" % (path, err.splitlines()[0] if err else "refused"))
+                    continue
         git(repo, "worktree", "prune")
         # -d, never -D by default: git refuses a branch whose commits would be
         # lost, which is the one judgement here worth deferring to git for.
