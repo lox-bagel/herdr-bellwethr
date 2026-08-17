@@ -81,11 +81,15 @@ command = "drovr.move-tab"
 description = "drovr: move tab to workspace"
 
 [theme]
-name = "terminal"
+name = "catppuccin"
 auto_switch = false
 
 [ui]
 agent_panel_sort = "spaces"
+show_agent_labels_on_pane_borders = true
 
 [ui.toast]
 delivery = "herdr"
+
+[ui.sound]
+enabled = false
