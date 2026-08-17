@@ -1026,49 +1026,46 @@ DEFAULT_TASK_FILE = "TASK.md"
 ASKING_RULE = """\
 ---
 
-## What this task says, and what it does not
+## What task says, what it does not
 
-Everything above this line is the task as its requester wrote it, carried here
-unchanged. Nothing was looked up on your behalf and nothing was filled in on
-the way: no file or line numbers you were not given, no conventions, no
-conclusions about what the code currently does or why. Where it is silent, it
-is silent because the requester did not say — not because something was
-dropped in transit.
+Everything above this line is task as requester wrote it, carried here
+unchanged. Nothing looked up for you, nothing filled in on the way: no file or
+line numbers you were not given, no conventions, no conclusions about what code
+currently does or why. Where silent, silent because requester did not say — not
+because something got dropped in transit.
 
-This session is interactive and whoever dispatched it can read it and answer.
-Read the repository for what the repository can tell you, and ask here for the
-rest rather than deciding it yourself: which of two readings was meant, whether
-a constraint holds, where something lives. A question costs a message; a guess
-costs whatever gets built on it.
+Session is interactive. Whoever dispatched it reads it and answers. Read
+repository for what repository can tell you. Ask here for rest instead of
+deciding yourself: which of two readings was meant, whether constraint holds,
+where something lives. Question costs one message. Guess costs whatever gets
+built on it.
 """
 
 REPORTING_RULE = """\
 ---
 
-## How this work is reported
+## How work is reported
 
-The pull request body is exactly the branch name, followed by whatever body
-GitHub or `gh pr create` fills in on its own — the repository's pull request
-template if it has one, and nothing further if it has none. No summary, no
-rationale, no verification transcript, no test output, no tables, no headings.
-And no pull request comments at all: not on this pull request, not on anybody
-else's.
+Pull request body is exactly the branch name, plus whatever GitHub or `gh pr
+create` fills in by itself — repository's pull request template if it has one,
+nothing more if it has none. No summary, no rationale, no verification
+transcript, no test output, no tables, no headings. And no pull request
+comments at all: not on this pull request, not on anybody else's.
 
-Commit messages are short as well: a conventional subject, and at most a line
-or two more where the subject cannot carry the point on its own. Not
-paragraphs, and not a retelling of the diff — the diff is already there. The
-branch is rebased onto the base, so each commit is kept exactly as written.
+Commit messages short too: conventional subject, plus at most a line or two
+where subject cannot carry point alone. No paragraphs, no retelling of diff —
+diff is already there. Branch gets rebased onto base, so each commit stays
+exactly as written.
 
-The branch survives the merge. `gh pr merge --rebase` on its own leaves it
-alone; `--delete-branch` does not, and neither does deleting it by hand
-afterwards. GitHub is configured not to delete branches on merge either, so a
-branch that goes missing went missing because somebody asked for that — and the
-branch name is what the work is still called long after the pull request has
-scrolled out of view.
+Branch survives merge. `gh pr merge --rebase` alone leaves it alone;
+`--delete-branch` deletes it, and so does deleting it by hand afterwards.
+GitHub is configured not to delete branches on merge either. Branch that goes
+missing went missing because somebody asked for that — and branch name is what
+work is still called long after pull request scrolled out of view.
 
-Anything that needs saying at length — a conflict with other work, an
-assumption you had to make, something only another checkout can do — goes to
-whoever dispatched you, not into the repository.
+Anything that needs length — conflict with other work, assumption you had to
+make, something only another checkout can do — goes to whoever dispatched you,
+not into the repository.
 """
 
 
@@ -1235,29 +1232,28 @@ def task_document(args, repo, checkout, branch, workspace_id, pane_id):
         "not the one the task was written in.\n"
         "\n"
         "- This directory is a **linked git worktree**: `%s`\n"
-        "- The primary checkout is elsewhere: `%s`\n"
+        "- Primary checkout is elsewhere: `%s`\n"
         "- Branch `%s`, created from `%s`\n"
         "- herdr workspace `%s`, pane `%s`\n"
         "\n"
-        "A worktree shares its history with the primary checkout and nothing\n"
-        "else. Tooling that reaches outside the repository — installers, things\n"
-        "that link or copy files into a live configuration — may refuse to run\n"
-        "here, and refusing is usually the correct behaviour rather than a fault\n"
-        "to work around. If the task asks for something that only the primary\n"
-        "checkout can do, say so rather than forcing it.\n"
+        "Worktree shares history with primary checkout and nothing else.\n"
+        "Tooling that reaches outside the repository — installers, things that\n"
+        "link or copy files into a live configuration — may refuse to run here.\n"
+        "Refusing is usually correct behaviour, not a fault to work around. If\n"
+        "task asks for something only primary checkout can do, say so instead of\n"
+        "forcing it.\n"
         "\n"
-        "Workspaces are numbered as well, and people refer to them that way —\n"
-        "\"agent 3\", \"the one in 4\". `herdr workspace list` is where that\n"
-        "resolves: every workspace reports a `number`, the `workspace_id` above,\n"
-        "and a `worktree` object with `checkout_path` and `is_linked_worktree`.\n"
-        "The label carries the number too, as `[n] <name>`. The command runs\n"
-        "from in here.\n"
+        "Workspaces are numbered too, and people refer to them that way —\n"
+        "\"agent 3\", \"the one in 4\". `herdr workspace list` resolves that:\n"
+        "every workspace reports a `number`, the `workspace_id` above, and a\n"
+        "`worktree` object with `checkout_path` and `is_linked_worktree`. Label\n"
+        "carries the number too, as `[n] <name>`. Command runs from in here.\n"
         "\n"
-        "The number is positional: close a workspace and the ones after it are\n"
+        "Number is positional: close a workspace and ones after it get\n"
         "renumbered, so it names a workspace in conversation and nowhere else.\n"
-        "Nothing above records one for that reason. Look a number up when you\n"
-        "are given one rather than assuming which workspace is meant, and write\n"
-        "down the workspace id or the branch, never the number.\n"
+        "Nothing above records one, for that reason. Look a number up when you\n"
+        "are given one instead of assuming which workspace is meant, and write\n"
+        "down workspace id or branch, never number.\n"
         % (PROG, tilde(checkout, home), tilde(repo, home),
            branch, args.base, workspace_id, pane_id)
     )
