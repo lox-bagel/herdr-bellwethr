@@ -11,3 +11,17 @@ qu8n/herdr-automatic-rename
 # `engines: node >= 23`. Declared regardless — this list is what the config
 # recommends, not what a given machine can run.
 AVGVSTVS96/herdr-drovr
+
+# Considered for session management and not added:
+#
+#   andrewchng/herdr-sessionizer   [[build]] bun install
+#   fullerzz/herdr-plugin-sesh     [[build]] go build
+#   thanhdat77/herdr-navigator     [[build]] cargo build --release
+#   yuk1ty/herdr-spreader          [[build]] cargo build --release
+#   nikok6/herdr-mirror            prebuilt binary, but wants the preview
+#                                  channel at both ends, and ssh or docker
+#
+# Each of the first four adds a toolchain to the install floor, and three of
+# them map "session" onto a herdr *workspace*, which projects and `bellwethr
+# save` already cover. None manages a herdr session, which is a whole server:
+# a plugin runs inside one, and herdr refuses to attach from inside a pane.

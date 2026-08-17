@@ -1,0 +1,4 @@
+name = "Bellwethr: sessions    "
+description = "(unset):          What is in each herdr session; stop or delete one."
+type = "command"
+command = "herdr plugin action invoke herdr-bellwethr.sessions"
