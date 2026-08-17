@@ -1224,6 +1224,7 @@ def task_document(args, repo, checkout, branch, workspace_id, pane_id):
     if args.no_context:
         return document
 
+    home = os.path.expanduser("~")
     return document + (
         "\n"
         "---\n"
@@ -1257,7 +1258,8 @@ def task_document(args, repo, checkout, branch, workspace_id, pane_id):
         "Nothing above records one for that reason. Look a number up when you\n"
         "are given one rather than assuming which workspace is meant, and write\n"
         "down the workspace id or the branch, never the number.\n"
-        % (PROG, checkout, repo, branch, args.base, workspace_id, pane_id)
+        % (PROG, tilde(checkout, home), tilde(repo, home),
+           branch, args.base, workspace_id, pane_id)
     )
 
 
