@@ -1,4 +1,4 @@
 name = "Plus: save project     "
 description = "(prefix+shift+s): Save this space over the project named after it."
 type = "command"
-command = "herdr-project save --space '{{.WorkspaceId}}' --notify --force"
+command = "herdr-bellwethr save --space '{{.WorkspaceId}}' --notify --force"

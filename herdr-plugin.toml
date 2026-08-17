@@ -1,4 +1,4 @@
-# herdr-plugin.toml — registers herdr-project with herdr.
+# herdr-plugin.toml — registers herdr-bellwethr with herdr.
 #
 #   herdr plugin link ~/ws/herdr-bellwethr
 #
@@ -12,8 +12,8 @@
 # Windows is out of scope here, as it is everywhere else in this repo — herdr's
 # Windows build is preview-beta.
 
-id = "herdr-project"
-name = "Herdr Project"
+id = "herdr-bellwethr"
+name = "Herdr Bellwethr"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Save the current herdr space as a herdr-plus project, and delete saved ones from a fuzzy picker."
@@ -25,9 +25,9 @@ platforms = ["linux", "macos"]
 # the portable way back into the CLI from a plugin command.
 [[actions]]
 id = "delete"
-title = "Herdr Project: delete a project"
+title = "Bellwethr: delete a project"
 platforms = ["linux", "macos"]
-command = ["/bin/sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin herdr-project --entrypoint delete-picker --placement overlay"]
+command = ["/bin/sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin herdr-bellwethr --entrypoint delete-picker --placement overlay"]
 
 # The picker itself, as a herdr-managed overlay pane. The command is relative
 # because herdr runs a pane's command with the plugin root as its working
@@ -40,4 +40,4 @@ id = "delete-picker"
 title = "Delete project"
 placement = "overlay"
 platforms = ["linux", "macos"]
-command = ["./herdr-project", "delete", "--pick", "--notify"]
+command = ["./herdr-bellwethr", "delete", "--pick", "--notify"]

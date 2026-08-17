@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+#
+# dev-link — point this machine's herdr config at this repo, reversibly.
+#
+#   dev-link status     what is linked, what is a plain file, what has drifted
+#   dev-link apply      back up, then replace each target with a symlink here
+#   dev-link apply --adopt   first copy any live-only content back into the repo
+#   dev-link remove     turn every link back into a plain file (repo content)
+#
+# This exists so an edit lands in one place during development. It is not the
+# installer: the installer will *copy* files and record a receipt, because a
+# user's config should not depend on a checkout staying where it was. Symlinks
+# are the development shape of the same file list.
+#
+# Borrowed wholesale from herdr-lazy's prune: anything we are not certain about
+# is reported, not overwritten. A refused link is an annoyance you can resolve
+# by hand; clobbering a file you had edited is not recoverable. So `apply`
+# refuses any target whose live content differs from the repo's, and says what
+# differs, until you pass --adopt (take the live version) or --force (discard
+# it). Either way the previous content is copied to a backup directory first.
+#
+# What is deliberately NOT linked, and why:
+#
+#   plugins.lock   herdr-lazy owns it and rewrites it on every sync. It is a
+#                  resolution record, not configuration — the repo copy is a
+#                  snapshot, and linking would let a sync rewrite the repo.
+#   projects/*     user data. `herdr-bellwethr save` writes it, the user names it,
+#                  and nothing here should install, link, or remove it. The
+#                  repo's copy is a worked example, not something to install.
+#
+# One hazard worth knowing about: a symlink survives an in-place write but not
+# an atomic write-and-rename, which replaces the link with a plain file and
+# strands the repo copy silently. herdr writes config.toml itself (that is where
+# `onboarding = false` came from) and so does herdr-lazy when it binds a key.
+# `status` is how you notice: a target that should be a link and reads as a
+# plain file has drifted, and the diff tells you which side moved.
+
+"""Symlink this repo's config into a live herdr install, reversibly."""
+
+import argparse
+import filecmp
+import hashlib
+import os
+import os.path
+import shutil
+import subprocess
+import sys
+import time
+
+PROG = "dev-link"
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+PLUS_ID = "cloudmanic.herdr-plus"
+LAZY_ID = "herdr-lazy"
+
+
+def warn(msg):
+    sys.stderr.write("%s: warning: %s\n" % (PROG, msg))
+
+
+def die(msg):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ herdr ---
+
+def herdr_config_dir():
+    """Where herdr keeps config.toml, plugins.json and the plugin config dirs."""
+    socket = os.environ.get("HERDR_SOCKET_PATH")
+    if socket:
+        return os.path.dirname(socket)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "herdr")
+
+
+def plugin_config_dir(plugin_id):
+    """Ask herdr, the same way herdr-bellwethr does — never guess this path.
+
+    herdr provisions the directory and keeps it across plugin upgrades, so it is
+    the one the plugin itself will read.
+    """
+    try:
+        proc = subprocess.run(
+            ("herdr", "plugin", "config-dir", plugin_id),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError:
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        path = proc.stdout.decode("utf-8", "replace").strip()
+        if path and not path.startswith("{"):
+            return path
+    return os.path.join(herdr_config_dir(), "plugins", "config", plugin_id)
+
+
+# ------------------------------------------------------------------ links ---
+
+def targets():
+    """Every (repo file, live path) pair this tool manages, in apply order.
+
+    Quick actions are listed one file at a time rather than linking the
+    directory: the live directory is shared with whatever actions the user
+    writes, and a directory symlink would hide them all behind the repo's set.
+    Per-file links leave the user's own files alone, which is also the shape the
+    installer's receipt will need.
+    """
+    pairs = []
+
+    pairs.append((
+        os.path.join(REPO, "config", "config.toml"),
+        os.path.join(herdr_config_dir(), "config.toml"),
+    ))
+
+    quick = os.path.join(REPO, "config", "quick-actions")
+    live_quick = os.path.join(plugin_config_dir(PLUS_ID), "quick-actions")
+    for name in sorted(os.listdir(quick)):
+        if name.endswith(".toml"):
+            pairs.append((os.path.join(quick, name), os.path.join(live_quick, name)))
+
+    pairs.append((
+        os.path.join(REPO, "config", "plugins.list"),
+        os.path.join(plugin_config_dir(LAZY_ID), "plugins.list"),
+    ))
+
+    return pairs
+
+
+def digest(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def state(repo_path, live_path):
+    """Classify one target. The whole tool turns on getting this right."""
+    if not os.path.exists(repo_path):
+        return "repo-missing"
+    if os.path.islink(live_path):
+        dest = os.path.realpath(live_path)
+        if dest == os.path.realpath(repo_path):
+            return "linked"
+        return "linked-elsewhere"
+    if not os.path.exists(live_path):
+        return "absent"
+    if digest(live_path) == digest(repo_path):
+        return "same"
+    return "differs"
+
+
+LABELS = {
+    "linked": "linked",
+    "linked-elsewhere": "linked to something else",
+    "absent": "not installed",
+    "same": "plain file, identical",
+    "differs": "plain file, DIFFERS",
+    "repo-missing": "missing from repo",
+}
+
+
+def relative(path):
+    home = os.path.expanduser("~")
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+# ----------------------------------------------------------------- backups ---
+
+def backup_root():
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(herdr_config_dir(), "bellwethr-backups", stamp)
+
+
+def back_up(live_path, root):
+    """Copy a live file aside before we touch it, preserving its full path.
+
+    Backups live under herdr's config dir, not in the repo: they are this
+    machine's previous state, and committing them would be noise at best.
+    """
+    dest = os.path.join(root, live_path.lstrip(os.sep))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(live_path, dest)
+    return dest
+
+
+# -------------------------------------------------------------- subcommands --
+
+def cmd_status(args):
+    counts = {}
+    for repo_path, live_path in targets():
+        kind = state(repo_path, live_path)
+        counts[kind] = counts.get(kind, 0) + 1
+        marker = "  " if kind in ("linked", "same") else "! "
+        print("%s%-24s %s" % (marker, LABELS[kind], relative(live_path)))
+
+    print("")
+    print("not managed by this tool:")
+    lock = os.path.join(plugin_config_dir(LAZY_ID), "plugins.lock")
+    print("  %-24s %s" % ("herdr-lazy rewrites it", relative(lock)))
+    projects = os.path.join(plugin_config_dir(PLUS_ID), "projects")
+    print("  %-24s %s" % ("user data", relative(projects)))
+
+    print("")
+    print("plugin registration:")
+    for path, what in (
+        (os.path.expanduser("~/.local/bin/herdr-bellwethr"), "herdr-bellwethr on PATH"),
+        (os.path.join(REPO, "herdr-plugin.toml"), "manifest herdr has registered"),
+    ):
+        if os.path.islink(path):
+            print("  %-24s %s -> %s" % ("linked", relative(path), relative(os.path.realpath(path))))
+        elif os.path.exists(path):
+            print("  %-24s %s" % ("present", relative(path)))
+        else:
+            print("! %-24s %s" % ("missing", relative(path)))
+
+    drifted = sum(counts.get(k, 0) for k in ("differs", "linked-elsewhere", "repo-missing"))
+    return 1 if drifted else 0
+
+
+def cmd_apply(args):
+    pairs = targets()
+
+    # Refuse the whole run rather than half of it. A partial apply leaves the
+    # machine in a state neither `status` nor the user can reason about.
+    blocked = []
+    for repo_path, live_path in pairs:
+        kind = state(repo_path, live_path)
+        if kind == "repo-missing":
+            blocked.append((live_path, "missing from repo"))
+        elif kind == "linked-elsewhere":
+            blocked.append((live_path, "already a link to %s" % os.path.realpath(live_path)))
+        elif kind == "differs" and not (args.adopt or args.force):
+            blocked.append((live_path, "live content differs from the repo"))
+
+    if blocked:
+        sys.stderr.write("%s: refusing to link — resolve these first:\n" % PROG)
+        for path, why in blocked:
+            sys.stderr.write("  %s\n    %s\n" % (relative(path), why))
+        sys.stderr.write(
+            "\n--adopt copies the live version into the repo and links that.\n"
+            "--force discards it (a backup is taken either way).\n"
+            "`diff <repo file> <live file>` shows what you would lose.\n"
+        )
+        return 1
+
+    root = backup_root()
+    linked = adopted = already = 0
+
+    for repo_path, live_path in pairs:
+        kind = state(repo_path, live_path)
+        if kind == "linked":
+            already += 1
+            continue
+
+        if kind in ("same", "differs"):
+            back_up(live_path, root)
+            if kind == "differs" and args.adopt:
+                shutil.copy2(live_path, repo_path)
+                print("adopted %s -> %s" % (relative(live_path), relative(repo_path)))
+                adopted += 1
+            os.unlink(live_path)
+
+        os.makedirs(os.path.dirname(live_path), exist_ok=True)
+        os.symlink(repo_path, live_path)
+        linked += 1
+
+    print("")
+    print("linked %d, already linked %d, adopted %d" % (linked, already, adopted))
+    if linked:
+        print("backup of what was replaced: %s" % relative(root))
+        print("run `herdr server reload-config` to pick up config.toml")
+    return 0
+
+
+def cmd_remove(args):
+    """Undo `apply`: every link becomes a plain file holding the repo's content.
+
+    Not a delete. Removing the link should leave the machine configured exactly
+    as it is now — the point is to stop the live config depending on this
+    checkout, not to strip the config out.
+    """
+    restored = skipped = 0
+    for repo_path, live_path in targets():
+        kind = state(repo_path, live_path)
+        if kind != "linked":
+            if kind not in ("absent",):
+                print("! left alone (%s) %s" % (LABELS[kind], relative(live_path)))
+                skipped += 1
+            continue
+        os.unlink(live_path)
+        shutil.copy2(repo_path, live_path)
+        restored += 1
+
+    print("")
+    print("unlinked %d (now plain files), left alone %d" % (restored, skipped))
+    return 0
+
+
+# -------------------------------------------------------------------- main --
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Symlink this repo's config into a live herdr install.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    status = subparsers.add_parser("status", help="show what is linked")
+    status.set_defaults(func=cmd_status)
+
+    apply_cmd = subparsers.add_parser("apply", help="replace live config with links here")
+    apply_cmd.add_argument("--adopt", action="store_true",
+                           help="copy live-only content into the repo, then link it")
+    apply_cmd.add_argument("--force", action="store_true",
+                           help="discard live content that differs (backup is still taken)")
+    apply_cmd.set_defaults(func=cmd_apply)
+
+    remove = subparsers.add_parser("remove", help="turn links back into plain files")
+    remove.set_defaults(func=cmd_remove)
+
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

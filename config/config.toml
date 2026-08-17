@@ -1,3 +1,4 @@
+onboarding = false
 # Custom command keybinds.
 #
 # Every binding carries a `description` — that is what the prefix+? help menu
@@ -37,7 +38,7 @@ description = "Herdr Plus: projects"
 [[keys.command]]
 key = "prefix+shift+s"
 type = "shell"
-command = "herdr-project save --notify --force"
+command = "herdr-bellwethr save --notify --force"
 description = "Herdr Plus: save project"
 
 [theme]

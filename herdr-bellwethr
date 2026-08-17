@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
-# herdr-project — save, list, and delete herdr-plus projects.
+# herdr-bellwethr — save, list, and delete herdr-plus projects.
 #
-#   herdr-project save                     save the current space, named after it
-#   herdr-project save "Options Cafe"      save it under a different project name
-#   herdr-project save --stdout            print the TOML instead of writing it
-#   herdr-project list                     what is in the projects dir
-#   herdr-project delete "Options Cafe"    remove one
+#   herdr-bellwethr save                     save the current space, named after it
+#   herdr-bellwethr save "Options Cafe"      save it under a different project name
+#   herdr-bellwethr save --stdout            print the TOML instead of writing it
+#   herdr-bellwethr list                     what is in the projects dir
+#   herdr-bellwethr delete "Options Cafe"    remove one
 #
 # `save` snapshots the space you are looking at — tabs, panes, split directions,
 # working dirs and the commands actually running — into one *.toml file in
@@ -38,9 +38,11 @@ SPLIT_RIGHT = "right"
 # *inside* it, which is just as uninteresting to replay.
 SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish"}
 
-PLUGIN_ID = "cloudmanic.herdr-plus"
+# The plugin whose config dir holds projects/ — herdr-plus, not this one. The
+# projects browser reads them, we write them, so the path has to be its dir.
+PLUS_ID = "cloudmanic.herdr-plus"
 
-PROG = "herdr-project"
+PROG = "herdr-bellwethr"
 
 # Set by --notify. Both the keybind and the quick-action launcher run this with
 # no terminal anyone will read — the launcher's output goes to the picker pane
@@ -116,7 +118,7 @@ def plugin_config_dir():
     """
     try:
         proc = subprocess.run(
-            ("herdr", "plugin", "config-dir", PLUGIN_ID),
+            ("herdr", "plugin", "config-dir", PLUS_ID),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
