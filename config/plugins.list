@@ -6,3 +6,9 @@ natori-hrj/herdr-lazy
 cloudmanic/herdr-plus
 persiyanov/herdr-reviewr
 qu8n/herdr-automatic-rename
+
+# Node-based, and picky about which node: it runs its TypeScript sources
+# directly, so package.json declares `engines: node >= 23`. Declared here
+# regardless — the list is what this config recommends, not what a given
+# machine can run. See the note in config.toml above the prefix+m binds.
+AVGVSTVS96/herdr-drovr

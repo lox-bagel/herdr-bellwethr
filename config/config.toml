@@ -54,6 +54,32 @@ type = "plugin_action"
 command = "persiyanov.reviewr.toggle"
 description = "reviewr: toggle diff pane"
 
+# drovr's two movers: take what is focused somewhere else without restarting it.
+# A tab goes to another workspace, a pane goes to another tab; both keep their
+# processes — the live agents included — which is the whole point of moving
+# rather than closing and reopening.
+#
+# m for move, and it was free: herdr binds no plain m and no shift+m (its own
+# keys are the ones listed in config/quick-actions/), and nothing above claims
+# either. The split follows herdr's own convention that a plain key acts on the
+# pane and the shift key acts on the tab — prefix+x closes a pane, prefix+shift+x
+# closes a tab — so prefix+m moves the pane and prefix+shift+m moves the tab.
+# It is also what drovr's own README suggests, so muscle memory carries over.
+#
+# NOTE: drovr needs node >= 23 to run at all; this machine has v18. These binds
+# are correct and inert until that is fixed. See config/plugins.list.
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "drovr.move-pane"
+description = "drovr: move pane to tab"
+
+[[keys.command]]
+key = "prefix+shift+m"
+type = "plugin_action"
+command = "drovr.move-tab"
+description = "drovr: move tab to workspace"
+
 [theme]
 name = "terminal"
 auto_switch = false
