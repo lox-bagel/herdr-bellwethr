@@ -1233,6 +1233,48 @@ def fail(args, stage, message, detail=""):
     sys.exit(1)
 
 
+def task_document(args, repo, checkout, branch, workspace_id, pane_id):
+    """The task, plus the facts about where it is being carried out.
+
+    An agent dropped into a fresh worktree has no way to know it is in one. It
+    sees a checkout that looks like the repository and reasons about it as if it
+    were — which is how a task written by somebody sitting in the primary
+    checkout ends up asking for something only the primary checkout can do. The
+    difference is not a matter of opinion, so it is stated rather than left to
+    be discovered.
+
+    Deliberately facts, not instructions. This says what is true of the place;
+    what to do about it belongs in the task, which is somebody else's to write.
+    """
+    if args.no_context:
+        return args.task.rstrip("\n") + "\n"
+
+    return (
+        "%s\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Where this is running\n"
+        "\n"
+        "Written by `%s dispatch`. You did not choose this checkout and it is\n"
+        "not the one the task was written in.\n"
+        "\n"
+        "- This directory is a **linked git worktree**: `%s`\n"
+        "- The primary checkout is elsewhere: `%s`\n"
+        "- Branch `%s`, created from `%s`\n"
+        "- herdr workspace `%s`, pane `%s`\n"
+        "\n"
+        "A worktree shares its history with the primary checkout and nothing\n"
+        "else. Tooling that reaches outside the repository — installers, things\n"
+        "that link or copy files into a live configuration — may refuse to run\n"
+        "here, and refusing is usually the correct behaviour rather than a fault\n"
+        "to work around. If the task asks for something that only the primary\n"
+        "checkout can do, say so in the pull request instead of forcing it.\n"
+        % (args.task.rstrip("\n"), PROG, checkout, repo, branch, args.base,
+           workspace_id, pane_id)
+    )
+
+
 def cmd_dispatch(args):
     repo = repo_root(os.path.abspath(os.path.expanduser(args.repo or os.getcwd())))
     branch = args.branch.strip()
@@ -1269,7 +1311,8 @@ def cmd_dispatch(args):
     task_path = os.path.join(checkout, args.task_file)
     try:
         with open(task_path, "w") as handle:
-            handle.write(args.task.rstrip("\n") + "\n")
+            handle.write(task_document(args, repo, checkout, branch,
+                                       workspace_id, pane_id))
     except OSError as exc:
         teardown(workspace_id, repo, branch, checkout)
         fail(args, "task", "could not write %s: %s" % (task_path, exc))
@@ -1315,6 +1358,11 @@ def cmd_dispatch(args):
         print("dispatched %s to %s (%s)" % (branch, alias, args.kind))
         print("  checkout   %s" % checkout)
         print("  workspace  %s   pane %s" % (workspace_id, pane_id))
+        # The name is the convenient handle and the pane is the durable one: a
+        # herdr restart keeps the pane and its process but forgets the alias,
+        # and `agent prompt <name>` then answers agent_not_found.
+        print("  reach it   herdr agent prompt %s ...   (or %s, which survives "
+              "a herdr restart)" % (alias, pane_id))
         print("  task       %s" % task_path)
         if not submitted:
             print("  ! the prompt did not land: %s" % (prompt_err or "no reason given"))
@@ -1584,7 +1632,9 @@ def main():
         epilog="--branch is required and never derived: which names a repo accepts is "
                "the repo's business, so ask `conventions` first and let the caller "
                "choose. A branch the repo's pre-commit hook rejects is reported with "
-               "that hook's own words, and everything created is torn down again.")
+               "that hook's own words, and everything created is torn down again. The "
+               "agent's name is forgotten if herdr restarts, so hold on to the pane id "
+               "it reports — that keeps working.")
     dispatch.add_argument("task", help="the task, written into the worktree for the agent")
     dispatch.add_argument("--branch", required=True, metavar="NAME",
                           help="branch to create (required; nothing here invents one)")
@@ -1600,6 +1650,9 @@ def main():
                           help="where to write the task (default: %s)" % DEFAULT_TASK_FILE)
     dispatch.add_argument("--prompt", metavar="TEXT",
                           help="what to say to the agent (default: read the task file)")
+    dispatch.add_argument("--no-context", action="store_true",
+                          help="write the task alone, without the note saying "
+                               "which worktree and branch it is running in")
     dispatch.add_argument("--no-probe", action="store_true",
                           help="skip asking the repo's pre-commit about the branch name")
     dispatch.add_argument("--focus", action="store_true", help="focus the new workspace")
