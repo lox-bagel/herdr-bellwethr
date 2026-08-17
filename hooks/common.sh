@@ -63,6 +63,6 @@ bellwethr_check_branch() {
 	echo "  example: feat/pr-title-lint" >&2
 	echo >&2
 	echo "  git branch -m <new-name>          rename it" >&2
-	echo "  BELLWETHR_ALLOW_MAIN=1 ...        skip every check in these hooks" >&2
+	echo "  BELLWETHR_SKIP_CHECKS=1 ...       skip every check in these hooks" >&2
 	return 1
 }
