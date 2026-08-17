@@ -1379,18 +1379,6 @@ def worktree_entries(repo):
     return out
 
 
-# Reasons that leave the branch's commits somewhere other than this checkout —
-# on another remote branch, or on the branch's own remote branch behind a pull
-# request. Deleting the local branch loses nothing in either case, so a
-# `git branch -d` refusal is git being literal rather than git being right.
-# Matched as prefixes: a pull request reason carries its number.
-RECOVERABLE = (
-    "its upstream branch is gone",
-    "its commits are on another remote branch",
-    "its pull request ",
-)
-
-
 def is_dirty(path, task_file):
     """Uncommitted work, ignoring the task file dispatch wrote.
 
@@ -1588,7 +1576,7 @@ def cmd_reap(args):
         return
 
     task_file = args.task_file
-    for path, branch, reason in removable:
+    for path, _, _ in removable:
         workspace_id = workspace_of.get(path)
         if workspace_id:
             herdr_quiet("worktree", "remove", "--workspace", workspace_id)
@@ -1605,32 +1593,10 @@ def cmd_reap(args):
                     warn("kept %s: %s" % (path, err.splitlines()[0] if err else "refused"))
                     continue
         git(repo, "worktree", "prune")
-        # -d, never -D by default: whether commits would be lost is the one
-        # judgement worth deferring to git for.
-        code, _, err = git(repo, "branch", "-d", branch)
-        if code == 0:
-            continue
-
-        # A rebase or squash merge leaves the branch's commits nowhere in the
-        # base, so git calls it unmerged however thoroughly the work landed —
-        # and a closed pull request never landed at all, though its commits are
-        # still on the remote. Hence --delete-branch, and only for those: never
-        # on the "merged into base" reading alone.
-        #
-        # Local only. The remote branch stays, so a closed pull request can be
-        # reopened, or the branch checked out again and a new one raised.
-        recoverable = reason.startswith(RECOVERABLE)
-        if args.delete_branch and recoverable:
-            code, _, err = git(repo, "branch", "-D", branch)
-            if code == 0:
-                print("  deleted branch %s (%s)" % (branch, reason))
-                continue
-
-        warn("kept branch %s: %s%s" % (
-            branch,
-            err.splitlines()[0] if err else "refused",
-            "" if args.delete_branch or not recoverable
-            else " — pass --delete-branch to remove it anyway"))
+        # The branch stays. A worktree is a directory and can be made again
+        # from the branch it held; the branch is the name the work goes on
+        # being called, and reap is not the place to decide it is finished
+        # with. Delete one by hand if you mean to.
 
 
 # -------------------------------------------------------------------- main --
@@ -1747,17 +1713,14 @@ def main():
                     "turned down. Reads pull request state through `gh` where "
                     "there is one to read.",
         epilog="Reports and removes nothing until --remove, and never deletes a "
-               "remote branch. A worktree kept a day too long costs a directory; one "
+               "branch, local or remote. A worktree kept a day too long costs a "
+               "directory; one "
                "removed a moment too early costs whatever was in it, so anything "
                "uncertain is kept and said out loud.")
     reap.add_argument("--repo", metavar="PATH", help="repository (default: cwd)")
     reap.add_argument("--base", metavar="REF", default="main",
                       help="branch work merges into (default: main)")
     reap.add_argument("--remove", action="store_true", help="actually remove them")
-    reap.add_argument("--delete-branch", action="store_true",
-                      help="also delete the local branch where git calls it "
-                           "unmerged but nothing is lost: a rebase or squash merge, "
-                           "or a pull request closed unmerged. Never the remote one")
     reap.add_argument("--task-file", metavar="NAME", default=DEFAULT_TASK_FILE,
                       help="task file dispatch writes, ignored when judging a "
                            "worktree dirty (default: %s)" % DEFAULT_TASK_FILE)
